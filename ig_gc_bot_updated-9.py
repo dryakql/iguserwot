@@ -91,11 +91,13 @@ import logging
 import platform
 import shutil
 import secrets
+import asyncio
 import threading
 import unicodedata
 import urllib.parse
 import datetime as dt
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -1067,7 +1069,7 @@ def human_bytes(n: float) -> str:
 
 
 def system_stats() -> str:
-    cpu = psutil.cpu_percent(interval=0.1)
+    cpu = psutil.cpu_percent(interval=None)
     freq = psutil.cpu_freq()
     vm = psutil.virtual_memory()
     sw = psutil.swap_memory()
@@ -2702,8 +2704,6 @@ def setup_headless() -> str:
 
 
 # ============================ FASTAPI WEB PANEL ============================
-import asyncio
-
 WEB_PANEL_ENABLED = os.getenv("WEB_PANEL", "1").strip().lower() not in ("0", "false", "no", "off")
 WEB_PANEL_HOST = os.getenv("WEB_PANEL_HOST", "0.0.0.0").strip()
 try:
@@ -2719,6 +2719,9 @@ PANEL_LOCK_TIMEOUT = 0.05
 PANEL_FAST_WAIT = 0.35
 
 _PANEL_ASYNC_LOCK = asyncio.Lock()
+_PANEL_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="panel-io")
+_PANEL_STATE_CACHE: dict = {}
+_PANEL_CACHE_LOCK = threading.Lock()
 
 WEB_CMD_QUEUE: deque = deque()
 WEB_CMD_RESULTS: dict = {}
@@ -2947,16 +2950,37 @@ def _safe_panel_path(rel_path: str):
 
 
 def _snapshot_state_sync(include_logs: bool = False) -> dict:
+    # Non-blocking psutil sample so polling never sleeps on interval
+    cpu = psutil.cpu_percent(interval=None)
+    vm = psutil.virtual_memory()
+    proc_mb = round(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024), 1)
+
     if not _STATE_LOCK.acquire(timeout=PANEL_LOCK_TIMEOUT):
+        with _PANEL_CACHE_LOCK:
+            cached = dict(_PANEL_STATE_CACHE)
+        if cached:
+            cached["uptime"] = human_time(time.time() - START_TIME)
+            cached["system"] = {
+                "cpu_percent": round(cpu, 1),
+                "ram_percent": round(vm.percent, 1),
+                "rss_mb": proc_mb,
+            }
+            if include_logs:
+                cached["logs"] = PANEL_LOGS.dump()
+            return cached
         return {}
+
     try:
+        with _STATE_LOCK:
+            ig_set = set(state.get("ignored", {}).keys())
+            state_copy = copy.deepcopy(state)
         groups_list = [
-            {"id": gid, "name": gname, "ignored": gid in state.get("ignored", {})}
+            {"id": gid, "name": gname, "ignored": gid in ig_set}
             for gid, gname in list(group_names.items())
         ]
         payload = {
             "bot_user": RUNTIME.get("me", ""),
-            "owner": OWNER_USERNAME or state.get("owner_username", ""),
+            "owner": OWNER_USERNAME or state_copy.get("owner_username", ""),
             "prefix": PREFIX,
             "uptime": human_time(time.time() - START_TIME),
             "follow_back_enabled": FOLLOW_BACK_ENABLED,
@@ -2970,8 +2994,16 @@ def _snapshot_state_sync(include_logs: bool = False) -> dict:
                 "cooldown_remaining": round(throttle.remaining(), 1),
                 "poll_multiplier": throttle.mult,
             },
-            "state": copy.deepcopy(state),
+            "system": {
+                "cpu_percent": round(cpu, 1),
+                "ram_percent": round(vm.percent, 1),
+                "rss_mb": proc_mb,
+            },
+            "state": state_copy,
         }
+        with _PANEL_CACHE_LOCK:
+            _PANEL_STATE_CACHE.clear()
+            _PANEL_STATE_CACHE.update(payload)
         if include_logs:
             payload["logs"] = PANEL_LOGS.dump()
         return payload
@@ -3234,7 +3266,8 @@ async function refreshAll(){
     if(res.status===401){document.getElementById('meta').textContent='Unauthorized — enter panel token at top right';return}
     const d = await res.json();
     if(!d.ok){document.getElementById('meta').textContent=d.message||'State busy';return}
-    document.getElementById('meta').textContent = `Bot: @${d.bot_user||'starting'} | Owner: @${d.owner||'-'} | Prefix: "${d.prefix}" | Uptime: ${d.uptime} | Groups: ${d.groups_count} | FollowBack: ${d.follow_back_enabled?'ON':'OFF'}`;
+    const sys = d.system || {};
+    document.getElementById('meta').textContent = `Bot: @${d.bot_user||'starting'} | Owner: @${d.owner||'-'} | Prefix: "${d.prefix}" | Uptime: ${d.uptime} | Groups: ${d.groups_count} | FollowBack: ${d.follow_back_enabled?'ON':'OFF'} | CPU ${sys.cpu_percent??'-'}% · RSS ${sys.rss_mb??'-'}MB`;
     const sel = document.getElementById('gcSelect');
     const prev = sel.value;
     sel.innerHTML = '<option value="">-- Default / Global --</option>';
@@ -3296,6 +3329,11 @@ async def panel_index():
     return HTMLResponse(content=_panel_html())
 
 
+@panel_router.get("/health")
+async def panel_health():
+    return {"ok": True, "status": "live", "uptime": human_time(time.time() - START_TIME)}
+
+
 @panel_router.get("/api/state", dependencies=[Depends(require_panel_token)])
 async def api_state(include_logs: bool = False):
     try:
@@ -3305,7 +3343,7 @@ async def api_state(include_logs: bool = False):
 
     try:
         loop = asyncio.get_running_loop()
-        snap = await loop.run_in_executor(None, _snapshot_state_sync, include_logs)
+        snap = await loop.run_in_executor(_PANEL_EXECUTOR, _snapshot_state_sync, include_logs)
         if not snap:
             return JSONResponse({"ok": False, "busy": True, "message": "State lock contended; retry shortly."})
         return JSONResponse({"ok": True, **snap})
@@ -3332,7 +3370,7 @@ async def api_command(payload: CommandPayload):
     wake_panel_loop()
 
     loop = asyncio.get_running_loop()
-    finished = await loop.run_in_executor(None, done_ev.wait, PANEL_FAST_WAIT)
+    finished = await loop.run_in_executor(_PANEL_EXECUTOR, done_ev.wait, PANEL_FAST_WAIT)
     if finished and _WEB_CMD_LOCK.acquire(timeout=PANEL_LOCK_TIMEOUT):
         try:
             res = WEB_CMD_RESULTS.pop(req_id, None)
@@ -3362,7 +3400,7 @@ async def api_login(payload: LoginPayload):
     wake_panel_loop()
 
     loop = asyncio.get_running_loop()
-    finished = await loop.run_in_executor(None, done_ev.wait, PANEL_FAST_WAIT)
+    finished = await loop.run_in_executor(_PANEL_EXECUTOR, done_ev.wait, PANEL_FAST_WAIT)
     if finished and _WEB_LOGIN_LOCK.acquire(timeout=PANEL_LOCK_TIMEOUT):
         try:
             res = WEB_LOGIN_RESULTS.pop(req_id, None)
@@ -3384,7 +3422,7 @@ async def api_get_file(path: str = "", download: int = 0):
     if not target or not target.exists():
         raise HTTPException(status_code=404, detail="File not found or invalid path.")
     loop = asyncio.get_running_loop()
-    data_bytes = await loop.run_in_executor(None, target.read_bytes)
+    data_bytes = await loop.run_in_executor(_PANEL_EXECUTOR, target.read_bytes)
     if download == 1:
         return Response(
             content=data_bytes,
@@ -3406,626 +3444,4 @@ async def api_save_file(payload: FilePayload):
 
     def _write():
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(payload.content, encoding="utf-8")
-        try:
-            os.chmod(target, 0o600)
-        except OSError:
-            pass
-        if target.name == "bot_state.json":
-            with _STATE_LOCK:
-                state.clear()
-                state.update(load_state())
-                USER_CACHE.clear()
-                USER_CACHE.update(state.get("user_cache") or {})
-
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _write)
-    log.info("🌐 Web Panel updated file: %s", payload.path)
-    return {"ok": True, "message": f"Saved {payload.path}"}
-
-
-app = FastAPI(title="IG GC Bot Panel")
-app.include_router(panel_router)
-
-
-def start_web_panel() -> None:
-    if not WEB_PANEL_ENABLED:
-        return
-
-    def _serve():
-        config = uvicorn.Config(
-            app,
-            host=WEB_PANEL_HOST,
-            port=WEB_PANEL_PORT,
-            log_level="warning",
-        )
-        server = uvicorn.Server(config)
-        server.run()
-
-    try:
-        threading.Thread(target=_serve, name="webpanel", daemon=True).start()
-        log.info("🌐 FastAPI Web Panel listening on http://%s:%s", WEB_PANEL_HOST, WEB_PANEL_PORT)
-    except Exception as e:
-        log.warning("Web Panel failed to start on %s:%s (%s)", WEB_PANEL_HOST, WEB_PANEL_PORT, e)
-
-
-def main() -> None:
-    global log, OWNER_PK, MY_PK
-    start_web_panel()
-    if not HEADLESS:
-        banner()
-    log = setup_logging()
-    if HEADLESS:
-        session_id = setup_headless()
-    else:
-        boot_steps(["Loading modules", "Starting live logger", "Arming console"])
-        session_id = setup_prompts()
-
-    log.info("🔑 Logging in...")
-    try:
-        login(session_id)
-    except Exception as e:
-        log.error("Login failed: %s", e)
-        sys.exit(f"\n   {c(196)}✖ Could not log in. {login_hint(e)}{R}")
-
-    my_pk = str(cl.user_id)
-    MY_PK = my_pk
-    try:
-        my_name = cl.username or cl.account_info().username
-    except Exception:
-        my_name = my_pk
-    RUNTIME["me"] = my_name
-    try:
-        if state.get("owner_pk") and state.get("owner_pk_for") == OWNER_USERNAME:
-            owner_pk = str(state["owner_pk"])
-        else:
-            owner_pk = str(paced(cl.user_id_from_username, OWNER_USERNAME))
-            with _STATE_LOCK:
-                state["owner_pk"], state["owner_pk_for"] = owner_pk, OWNER_USERNAME
-                save_state()
-        OWNER_PK = owner_pk
-    except Exception as e:
-        sys.exit(f"\n   {c(196)}✖ Owner username '{OWNER_USERNAME}' not found: {e}{R}")
-
-    startup_threads = None
-    log.info("📥 Fetching recent inbox threads to find your group chats...")
-    try:
-        startup_threads = fetch_inbox(THREADS_TO_SCAN)
-        startup_groups = index_group_chats(startup_threads)
-        log.info("📚 fetched %d group chat(s) from %d recent inbox thread(s)",
-                 len(startup_groups), len(startup_threads))
-        if startup_groups and not HEADLESS:
-            print(f"\n   {c(51)}{BOLD}GROUP CHAT SELECTION{R} {DIM}(choose which chats to ignore before monitoring starts){R}")
-            console_pick("", ignoring=True)
-        elif not startup_groups:
-            log.warning("No group chats appeared in the fetched inbox snapshot.")
-    except Exception as e:
-        log.warning("Initial group fetch failed (%s); the bot will retry in its main loop.", e)
-        if is_rate_limited(e):
-            throttle.hit(e, "startup scan")
-        startup_threads = None
-
-    if HEADLESS:
-        log.info("✅ @%s online - owner @%s - prefix '%s'", my_name, OWNER_USERNAME, PREFIX)
-    else:
-        show_dashboard(my_name)
-        hub = get_local_hub()
-        hub.single = True
-        hub.note_sid("(this bot)", getattr(cl, "sessionid", "") or session_id)
-        if hub.dynamic:
-            threading.Thread(target=hub.restore_saved, args=(6.0,), daemon=True).start()
-
-    if HEADLESS:
-        STOP.wait(random.uniform(0, POLL_MAX))
-    first_run = True
-    errors = 0
-    polls = 0
-    while not STOP.is_set():
-        try:
-            if startup_threads is not None:
-                threads = startup_threads
-                startup_threads = None
-            else:
-                throttle.wait_cooldown()
-                threads = fetch_recent()
-            register_panel_threads(threads)
-            flush_panel_login()
-            flush_web_commands()
-            groups = index_group_chats(threads)
-            new_msgs = 0
-            dm_new = 0
-            for t in groups:
-                tid = str(t.id)
-                if tid in state["ignored"]:
-                    watch_ignored(t, first_run, owner_pk)
-                    continue
-                new_msgs += process_thread(t, first_run, owner_pk, my_pk)
-            for t in threads:
-                if not getattr(t, "is_group", False):
-                    dm_new += watch_dm(t, owner_pk)
-            flush_hub_replies()
-            check_follow_backs()
-            n_ign = sum(1 for t in groups if str(t.id) in state["ignored"])
-            if first_run:
-                log.info("✅ ready — watching %d group chat(s), ignoring %d. Send %shelp in a GC.",
-                         len(groups) - n_ign, n_ign, PREFIX)
-            first_run = False
-            errors = 0
-            polls += 1
-            throttle.ok()
-            throttle.note_poll(bool(new_msgs or dm_new))
-            RUNTIME.update(polls=polls, groups=len(groups))
-            RUNTIME["msgs"] += new_msgs
-            log.debug("🔄 poll #%d · %d group(s) · %d new msg(s) · uptime %s",
-                     polls, len(groups), new_msgs, human_time(time.time() - START_TIME))
-        except LoginRequired:
-            if not relogin(session_id):
-                sys.exit(1)
-        except ChallengeRequired:
-            log.error("Instagram challenge required - verify the account manually, then restart.")
-            sys.exit(1)
-        except Exception as e:
-            if is_rate_limited(e):
-                throttle.hit(e, "inbox poll")
-            else:
-                errors += 1
-                wait = min(300, 15 * errors)
-                log.error("Loop error (%s). Backing off %ss", e, wait)
-                sleep_interruptible(wait)
-        sleep_interruptible(throttle.poll_delay())
-    goodbye()
-
-
-def goodbye() -> None:
-    if HUB is not None:
-        HUB.stop_all()
-    print(f"\n\n   {rainbow('Stopped. See you soon! — ' + BOT_NAME + ' BOT')}\n")
-
-
-# ============================ MULTI-ACCOUNT LAUNCHER =========================
-BOT_SCRIPT = os.path.abspath(__file__)
-ACCOUNTS_TEMPLATE = {
-    "owner": "your_main_username",
-    "stagger_seconds": 8,
-    "accounts": [
-        {"name": "bot1", "sessionid": "PASTE_SESSIONID_HERE"},
-        {"name": "bot2", "sessionid_env": "BOT2_SESSIONID", "enabled": False,
-         "owner": "optional_other_owner", "prefix": ".",
-         "welcome": "👋 Hi {mentions}, welcome to {group}!"},
-        {"name": "bot3", "username": "bot3_instagram_name", "password_env": "BOT3_PASSWORD",
-         "totp_seed_env": "BOT3_2FA_SECRET", "proxy": "", "enabled": False},
-    ],
-}
-LAUNCH_COLORS = [51, 213, 46, 220, 208, 171, 118, 39]
-_print_lock = threading.Lock()
-
-
-def find_accounts_file(explicit: str = ""):
-    if explicit:
-        f = Path(explicit).expanduser()
-        return f if f.exists() else None
-    for base in (Path.cwd(), Path(BOT_SCRIPT).parent):
-        f = base / "accounts.json"
-        if f.exists():
-            return f
-    return None
-
-
-def init_accounts_template() -> None:
-    target = Path.cwd() / "accounts.json"
-    if target.exists():
-        print(f"   {c(220)}accounts.json already exists ({target}) - edit it and run the script again.{R}")
-        return
-    target.write_text(json.dumps(ACCOUNTS_TEMPLATE, indent=2, ensure_ascii=False), encoding="utf-8")
-    try:
-        os.chmod(target, 0o600)
-    except OSError:
-        pass
-    print(f"   {c(46)}✔ created {target}{R}")
-    print(f"   {DIM}Fill in each bot's sessionid (or \"sessionid_env\": the NAME of an environment variable that\n"
-          f"   holds it), set \"owner\", then run: python {os.path.basename(BOT_SCRIPT)}{R}")
-    print(f"   {c(220)}⚠ Treat accounts.json like a password file and never commit it to git.{R}")
-
-
-def load_accounts(path):
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(data, list):
-        data = {"accounts": data}
-    default_owner = str(data.get("owner", "") or "").lstrip("@").lower()
-    stagger = float(data.get("stagger_seconds", 8))
-    base = path.parent
-    accounts, seen = [], set()
-    for i, a in enumerate(data.get("accounts", []), 1):
-        if not a.get("enabled", True):
-            continue
-        name = re.sub(r"[^A-Za-z0-9_-]", "_", str(a.get("name") or f"bot{i}"))
-        if name in seen:
-            raise ValueError(f"duplicate account name '{name}'")
-        seen.add(name)
-        sid, source = str(a.get("sessionid", "") or "").strip(), "accounts.json"
-        if (not sid or "PASTE" in sid.upper()) and a.get("sessionid_env"):
-            sid, source = os.getenv(str(a["sessionid_env"]), "").strip(), f"env {a['sessionid_env']}"
-        if "PASTE" in sid.upper():
-            sid = ""
-        user = str(a.get("username", "") or "").strip().lstrip("@")
-        pw = str(a.get("password", "") or "")
-        if not pw and a.get("password_env"):
-            pw = os.getenv(str(a["password_env"]), "")
-        totp = str(a.get("totp_seed", "") or "").strip()
-        if not totp and a.get("totp_seed_env"):
-            totp = os.getenv(str(a["totp_seed_env"]), "").strip()
-        has_login = bool(user and pw)
-        profile = base / "bots" / name
-        has_saved = (profile / "session.json").exists()
-        owner = str(a.get("owner") or default_owner).lstrip("@").lower()
-        problem = ""
-        if not owner:
-            problem = "no owner set"
-        elif not sid and not has_login and not has_saved:
-            problem = "no sessionid or username+password (and no saved session yet)"
-        if not sid and has_login and not problem:
-            source = "username/password"
-        elif not sid and has_saved and not problem:
-            source = "saved session"
-        accounts.append({"name": name, "owner": owner, "sid": sid, "source": source if not problem else "-",
-                         "welcome": str(a.get("welcome") or ""), "prefix": str(a.get("prefix") or ""),
-                         "profile": profile, "problem": problem, "username": user, "password": pw, "totp": totp,
-                         "proxy": str(a.get("proxy") or "")})
-    return accounts, stagger
-
-
-def _clean_name(raw) -> str:
-    return re.sub(r"[^A-Za-z0-9_-]", "_", str(raw or "").strip())[:24]
-
-
-def _pump(name: str, color: int, proc, width: int, acc: dict = None) -> None:
-    tag = f"{c(color)}{BOLD}[{name:<{width}}]{R} "
-    for line in proc.stdout:
-        if acc is not None and not acc.get("user"):
-            mm = re.search(r"@(\S+) online - owner", ANSI_RE.sub("", line))
-            if mm:
-                acc["user"] = mm.group(1)
-        with _print_lock:
-            sys.stdout.write(tag + line.rstrip("\n") + "\n")
-            sys.stdout.flush()
-    code = proc.wait()
-    with _print_lock:
-        sys.stdout.write(f"{tag}{c(220 if code == 0 else 196)}⛔ stopped (exit code {code}){R}\n")
-        sys.stdout.flush()
-
-
-def start_bot(acc: dict, color: int, width: int, hub_dir=None):
-    acc["profile"].mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
-    for k in ("IG_SESSIONID", "WELCOME_TEXT", "BOT_HUB", "IG_USERNAME", "IG_PASSWORD", "IG_TOTP_SEED", "IG_2FA_CODE"):
-        env.pop(k, None)
-    env.update(BOT_CHILD="1", HEADLESS="1", BOT_TAG=acc["name"], OWNER_USERNAME=acc["owner"],
-               PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
-    if hub_dir:
-        env["BOT_HUB"] = str(hub_dir)
-    if acc["sid"]:
-        env["IG_SESSIONID"] = acc["sid"]
-    if acc.get("username") and acc.get("password"):
-        env["IG_USERNAME"], env["IG_PASSWORD"] = acc["username"], acc["password"]
-        if acc.get("totp"):
-            env["IG_TOTP_SEED"] = acc["totp"]
-    if acc.get("proxy"):
-        env["IG_PROXY"] = acc["proxy"]
-    if acc["welcome"]:
-        env["WELCOME_TEXT"] = acc["welcome"]
-    if acc["prefix"]:
-        env["PREFIX"] = acc["prefix"]
-    proc = subprocess.Popen(
-        [sys.executable, "-u", BOT_SCRIPT], cwd=str(acc["profile"]), env=env,
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace", bufsize=1,
-    )
-    threading.Thread(target=_pump, args=(acc["name"], color, proc, width, acc), daemon=True).start()
-    return proc
-
-
-class Hub:
-    def __init__(self, base, width: int = 8) -> None:
-        self.base = Path(base)
-        self.dir = self.base / "bots" / "_hub"
-        self.saved_file = self.base / "bots" / "dynamic_bots.json"
-        self.width = max(8, width)
-        self.procs: dict = {}
-        self.accs: dict = {}
-        self.sids: dict = {}
-        self.logins: dict = {}
-        self.added_at: dict = {}
-        self.dynamic: dict = {}
-        self.single = False
-        self.lock = threading.RLock()
-        self.stop_flag = threading.Event()
-        self._color = 0
-        self._started = False
-
-    def start(self) -> None:
-        if self._started:
-            return
-        self._started = True
-        for sub in ("requests", "responses"):
-            d = self.dir / sub
-            d.mkdir(parents=True, exist_ok=True)
-            for f in d.glob("*"):
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
-        try:
-            os.chmod(self.dir, 0o700)
-        except OSError:
-            pass
-        try:
-            self.dynamic = {e["name"]: e for e in json.loads(self.saved_file.read_text(encoding="utf-8"))}
-        except Exception:
-            self.dynamic = {}
-        threading.Thread(target=self._watch, name="hub", daemon=True).start()
-
-    def _watch(self) -> None:
-        req_dir, res_dir = self.dir / "requests", self.dir / "responses"
-        while not self.stop_flag.is_set():
-            try:
-                for f in sorted(req_dir.glob("*.json")):
-                    try:
-                        req = json.loads(f.read_text(encoding="utf-8"))
-                    except Exception:
-                        req = None
-                    try:
-                        f.unlink()
-                    except OSError:
-                        pass
-                    if not isinstance(req, dict):
-                        continue
-                    try:
-                        res = self.handle(req)
-                    except Exception as e:
-                        res = {"ok": False, "msg": f"❌ hub error: {e}"}
-                    rid = re.sub(r"[^0-9A-Za-z_-]", "", str(req.get("id", "")))
-                    if rid:
-                        tmp = res_dir / f"{rid}.tmp"
-                        tmp.write_text(json.dumps(res, ensure_ascii=False), encoding="utf-8")
-                        tmp.replace(res_dir / f"{rid}.json")
-            except Exception:
-                pass
-            self.stop_flag.wait(1.0)
-
-    def _say(self, text: str) -> None:
-        with _print_lock:
-            print(text)
-
-    def note_sid(self, name: str, sid: str) -> None:
-        sid = unquote(sid or "").strip()
-        if sid:
-            self.sids[name] = sid
-
-    def _save_dynamic(self) -> None:
-        try:
-            self.saved_file.parent.mkdir(parents=True, exist_ok=True)
-            self.saved_file.write_text(json.dumps(list(self.dynamic.values()), indent=2, ensure_ascii=False),
-                                       encoding="utf-8")
-        except OSError as e:
-            self._say(f"   {c(220)}⚠ could not save {self.saved_file}: {e}{R}")
-
-    def _next_name(self) -> str:
-        taken = set(self.accs) | set(self.dynamic)
-        bots_dir = self.base / "bots"
-        if bots_dir.exists():
-            taken |= {q.name for q in bots_dir.iterdir()}
-        i = 2
-        while f"bot{i}" in taken:
-            i += 1
-        return f"bot{i}"
-
-    def _alive(self, name: str) -> bool:
-        return name not in self.procs or self.procs[name].poll() is None
-
-    def spawn(self, acc: dict):
-        color = LAUNCH_COLORS[self._color % len(LAUNCH_COLORS)]
-        self._color += 1
-        proc = start_bot(acc, color, self.width, self.dir)
-        with self.lock:
-            self.procs[acc["name"]] = proc
-            self.accs[acc["name"]] = acc
-            if acc.get("sid"):
-                self.sids[acc["name"]] = unquote(acc["sid"])
-            if acc.get("username"):
-                self.logins[acc["name"]] = acc["username"].lower()
-            acc["password"] = ""
-        return proc
-
-    def handle(self, req: dict) -> dict:
-        kind = req.get("kind")
-        if kind == "add":
-            return self.add(req)
-        if kind == "list":
-            return {"ok": True, "msg": self.describe()}
-        if kind == "stop":
-            return self.stop(str(req.get("name", "")))
-        return {"ok": False, "msg": "❌ unknown request"}
-
-    def add(self, req: dict) -> dict:
-        sid = unquote(str(req.get("sid", "")).strip())
-        username = str(req.get("username", "")).strip().lstrip("@")
-        password = str(req.get("password", ""))
-        owner = str(req.get("owner", "")).lstrip("@").lower()
-        by_login = bool(username or password)
-        if by_login and not (username and password):
-            return {"ok": False, "msg": "❌ I need both a username and a password."}
-        if not by_login and len(sid) < 20:
-            return {"ok": False, "msg": "❌ That sessionid is too short."}
-        if not owner:
-            return {"ok": False, "msg": "❌ No owner known for the new bot."}
-        key = f"login:{username.lower()}" if by_login else sid
-        with self.lock:
-            known = self.logins if by_login else self.sids
-            probe = username.lower() if by_login else sid
-            for n, sv in known.items():
-                if sv == probe and self._alive(n):
-                    recent = time.time() - self.added_at.get(key, 0) < 60
-                    return {"ok": False, "quiet": recent,
-                            "msg": f"ℹ️ That {'account' if by_login else 'session'} is already running as '{n}'."}
-            running = [n for n, pr in self.procs.items() if pr.poll() is None]
-            if len(running) >= MAX_BOTS:
-                return {"ok": False, "msg": f"❌ Limit reached ({MAX_BOTS} bots). Stop one with stopbot first."}
-            name = _clean_name(req.get("name")) or self._next_name()
-            if name in running:
-                return {"ok": False, "msg": f"❌ A bot named '{name}' is already running. Pick another name."}
-            prefix = str(req.get("prefix") or "")
-            acc = {"name": name, "owner": owner, "sid": "" if by_login else sid, "source": "chat command",
-                   "welcome": "", "prefix": prefix, "profile": self.base / "bots" / name, "problem": "",
-                   "username": username, "password": password, "totp": "", "proxy": ""}
-            self.spawn(acc)
-            self.added_at[key] = time.time()
-            self.dynamic[name] = {"name": name, "owner": owner, "prefix": prefix}
-            self._save_dynamic()
-        self._say(f"   {c(46)}✔ bot '{name}' added from chat (owner @{owner}){R}")
-        what = "password" if by_login else "sessionid"
-        extra = "\n⚠️ If this account has 2FA I can't ask for the code from here - use a sessionid instead." if by_login else ""
-        return {"ok": True, "msg": (f"🚀 Starting bot '{name}' (prefix {prefix or PREFIX}) - online in about 20s.\n"
-                                    f"🔐 Please UNSEND your message that contains the {what} "
-                                    f"(long-press it → Unsend).{extra}")}
-
-    def stop(self, name: str) -> dict:
-        with self.lock:
-            key = next((n for n in self.procs if n.lower() == name.strip().lower()), None)
-            if not key:
-                have = ", ".join(self.procs) or "none"
-                return {"ok": False, "msg": f"❌ No bot called '{name}'. Known bots: {have}"}
-            pr = self.procs[key]
-            if pr.poll() is None:
-                pr.terminate()
-                try:
-                    pr.wait(6)
-                except subprocess.TimeoutExpired:
-                    pr.kill()
-            if self.dynamic.pop(key, None) is not None:
-                self._save_dynamic()
-        return {"ok": True, "msg": f"🛑 Bot '{key}' stopped."}
-
-    def describe(self) -> str:
-        with self.lock:
-            lines = []
-            if self.single:
-                lines.append(f"(this bot) – @{RUNTIME['me']} – prefix '{PREFIX}' – running ✅")
-            for n, pr in self.procs.items():
-                a = self.accs.get(n, {})
-                state_txt = "running ✅" if pr.poll() is None else f"stopped (code {pr.returncode}) ⛔"
-                who = f"@{a['user']}" if a.get("user") else "starting…"
-                lines.append(f"{n} – {who} – prefix '{a.get('prefix') or PREFIX}' – {state_txt}")
-        return "🤖 Bots:\n" + "\n".join(lines) if lines else "No extra bots started yet."
-
-    def restore_saved(self, stagger: float = 0.0) -> None:
-        for e in list(self.dynamic.values()):
-            name = e["name"]
-            if name in self.procs and self.procs[name].poll() is None:
-                continue
-            profile = self.base / "bots" / name
-            if not (profile / "session.json").exists():
-                self._say(f"   {c(220)}⚠ chat-added bot '{name}' skipped: no saved session (use !addbot again){R}")
-                continue
-            if stagger and self.stop_flag.wait(stagger):
-                return
-            acc = {"name": name, "owner": str(e.get("owner", "")), "sid": "", "source": "saved session",
-                   "welcome": "", "prefix": str(e.get("prefix") or ""), "profile": profile, "problem": ""}
-            self.spawn(acc)
-            self._say(f"   {c(46)}✔ restored chat-added bot '{name}'{R}")
-
-    def stop_all(self) -> None:
-        self.stop_flag.set()
-        procs = list(self.procs.values())
-        for pr in procs:
-            if pr.poll() is None:
-                pr.terminate()
-        deadline = time.time() + 6
-        for pr in procs:
-            try:
-                pr.wait(max(0.1, deadline - time.time()))
-            except subprocess.TimeoutExpired:
-                pr.kill()
-
-
-def launch_multi(path) -> None:
-    banner()
-    try:
-        accounts, stagger = load_accounts(path)
-    except Exception as e:
-        sys.exit(f"   {c(196)}✖ Could not read {path}: {e}{R}")
-    if not accounts:
-        sys.exit(f"   {c(196)}✖ No enabled accounts in {path}.{R}")
-
-    print(f"   {c(213)}{BOLD}── MULTI-BOT MODE ──{R}  {DIM}{path}{R}\n")
-    width = max(len(a["name"]) for a in accounts)
-    for i, a in enumerate(accounts):
-        col = LAUNCH_COLORS[i % len(LAUNCH_COLORS)]
-        status = f"{c(196)}✖ skipped: {a['problem']}{R}" if a["problem"] else f"{c(46)}✔ ready{R} {DIM}(session: {a['source']}){R}"
-        print(f"   {c(col)}{BOLD}{a['name']:<{width}}{R}  owner @{a['owner'] or '?'}  {status}")
-    ready = [a for a in accounts if not a["problem"]]
-    if not ready:
-        sys.exit(f"\n   {c(196)}✖ Nothing to start. Fix accounts.json (run with --init for a template).{R}")
-    print(f"\n   {DIM}Starting {len(ready)} bot(s), {stagger:g}s apart. Type 'list', 'stop <name>' or 'quit' + Enter. Ctrl+C stops all.{R}")
-    print(f"   {DIM}More bots: as the owner send  {PREFIX}addbot <sessionid> [name] [prefix]  to any bot in chat.{R}\n")
-
-    hub = Hub(path.parent, width)
-    hub.start()
-
-    def console() -> None:
-        while not hub.stop_flag.is_set():
-            try:
-                raw = input().strip()
-            except (EOFError, OSError):
-                return
-            cmd, _, carg = raw.partition(" ")
-            cmd = cmd.lower()
-            if cmd in ("quit", "exit", "stop") and not carg:
-                hub.stop_flag.set()
-            elif cmd == "list":
-                with _print_lock:
-                    for line in hub.describe().split("\n"):
-                        print(f"   {line}")
-            elif cmd == "stop" and carg:
-                with _print_lock:
-                    print(f"   {hub.stop(carg.strip())['msg']}")
-            elif cmd:
-                print(f"   {DIM}commands: list | stop <name> | quit{R}")
-
-    threading.Thread(target=console, daemon=True).start()
-    try:
-        for i, acc in enumerate(ready):
-            if i and stagger:
-                hub.stop_flag.wait(stagger)
-            if hub.stop_flag.is_set():
-                break
-            hub.spawn(acc)
-        if not hub.stop_flag.is_set():
-            hub.restore_saved(stagger)
-        while not hub.stop_flag.is_set() and any(p.poll() is None for p in list(hub.procs.values())):
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        hub.stop_all()
-    goodbye()
-
-
-def _arg_value(flag: str) -> str:
-    a = sys.argv
-    return a[a.index(flag) + 1] if flag in a and a.index(flag) + 1 < len(a) else ""
-
-
-if __name__ == "__main__":
-    try:
-        if os.getenv("BOT_CHILD") != "1":
-            if "--init" in sys.argv:
-                init_accounts_template()
-                sys.exit(0)
-            if "--single" not in sys.argv:
-                acc_file = find_accounts_file(_arg_value("--accounts"))
-                if acc_file:
-                    launch_multi(acc_file)
-                    sys.exit(0)
-        main()
-    except (KeyboardInterrupt, EOFError):
-        goodbye()
+        target.write_text
