@@ -29,6 +29,7 @@ STAYING UNDER INSTAGRAM'S RATE LIMITS (all optional, all environment variables)
   IDLE_MAX_MULT         quiet chats are polled up to this many times slower (default 3, 1 = off)
   API_DELAY_MIN / MAX   random pause before every API call (default 0.3-0.9s)
   SEND_CAP_PER_MIN      most messages/actions per minute (default 20)
+  FOLLOW_BACK_INTERVAL  seconds between follower checks for auto follow-back (default 120)
   Type  rate  in the terminal to see cool-down, poll speed and how many requests were sent.
 
 MULTIPLE BOT ACCOUNTS (no pasting in the terminal)
@@ -197,11 +198,12 @@ try:
 except ValueError:
     MAX_BOTS = 10
 AUTOREPLY_COOLDOWN = 30             # seconds per keyword per chat
+FOLLOW_BACK_INTERVAL = max(30.0, _env_float("FOLLOW_BACK_INTERVAL", 120.0))
 
 DEFAULT_WELCOME = "👋 Welcome to {group}, {mentions}! Please read the rules and enjoy your stay 🎉"
 
 URL_RE = re.compile(
-    r"(?i)(?:\b(?:https?|ftp)://[^\s<>()]+|\bwww\.[^\s<>()]+|"
+    r"(?i)(?:(?:https?|ftp)://[^\s<>()]+|\bwww\.[^\s<>()]+|"
     r"\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}"
     r"(?::\d{2,5})?(?:[/?#][^\s<>()]*)?)"
 )
@@ -413,6 +415,7 @@ DEFAULT_STATE = {
     "user_reacts": {},          # tid -> {pk: {"name": str, "emojis": [str, ...]}}  (auto-reactions)
     "user_react_cooldown": 5,   # min seconds between auto-reactions to the same user
     "name_lock": {},            # tid -> locked group-chat name (bot reverts any change)
+    "followed_back": {},        # pk -> username of followers seen/followed back
     "login_method": "session",  # "session" | "password" - what was used last time
     "login_username": "",       # username used for password login (the password is NEVER saved)
     "session_user": "",         # whose account the saved session.json belongs to
@@ -863,6 +866,53 @@ def say_long(thread_id: str, text: str) -> None:
         chunk += ("\n" if chunk else "") + line
     if chunk:
         say(thread_id, chunk)
+
+
+def follow_back_loop(my_pk: str) -> None:
+    """Periodically check new followers and follow them back through the rate-limit governor."""
+    if not my_pk or not str(my_pk).isdigit():
+        return
+    followed = state.setdefault("followed_back", {})
+    seeded = False
+    while not STOP.is_set():
+        try:
+            throttle.wait_cooldown()
+            followers = paced(cl.user_followers, int(my_pk), amount=50) or {}
+            new_followers = []
+            for raw_pk, info in followers.items():
+                pk = str(raw_pk)
+                if not pk or pk == str(my_pk) or pk in state.get("banned", {}):
+                    continue
+                uname = getattr(info, "username", "") or pk
+                if pk not in followed:
+                    followed[pk] = uname
+                    if seeded:
+                        new_followers.append((pk, uname))
+
+            if not seeded:
+                seeded = True
+                save_state()
+                log.info("👥 indexed %d existing follower(s) for follow-back", len(followed))
+            elif new_followers:
+                save_state()
+                for pk, uname in new_followers:
+                    if STOP.is_set():
+                        break
+                    try:
+                        paced(cl.user_follow, int(pk), rate_limit_retry=True)
+                        log.info("🤝 followed back @%s (%s)", uname, pk)
+                    except Exception as e:
+                        if is_rate_limited(e):
+                            throttle.hit(e, "follow-back")
+                            break
+                        log.warning("follow-back failed for @%s: %s", uname, e)
+        except Exception as e:
+            if is_rate_limited(e):
+                throttle.hit(e, "followers check")
+            else:
+                log.debug("follow-back poll error: %s", e)
+
+        STOP.wait(FOLLOW_BACK_INTERVAL)
 
 
 USER_CACHE: dict = {}       # username -> pk (filled from every chat's member list = no API call needed)
@@ -1491,19 +1541,30 @@ def get_local_hub():
     global HUB
     with _HUB_LOCK:
         if HUB is None:
-            HUB = Hub(Path.cwd())
+            base = Path.cwd().parent if Path.cwd().parent.name == "bots" else Path.cwd()
+            HUB = Hub(base)
             HUB.start()
         return HUB
 
 
 def hub_call(req: dict, timeout: float = 30.0) -> dict:
     """Ask whoever hosts the bots (the launcher, or this very process) to add / list / stop a bot."""
-    hub_dir = os.getenv("BOT_HUB", "")
+    hub_dir = os.getenv("BOT_HUB", "").strip()
     if not hub_dir:
-        if HEADLESS:
-            return {"ok": False, "msg": "❌ No launcher is running, so I can't start other bots."}
-        return get_local_hub().handle(req)
+        candidate = Path.cwd() / "bots" / "_hub"
+        parent_candidate = Path.cwd().parent / "_hub"
+        if candidate.exists():
+            hub_dir = str(candidate)
+        elif parent_candidate.exists():
+            hub_dir = str(parent_candidate)
+        elif not HEADLESS:
+            return get_local_hub().handle(req)
+        else:
+            # Allow headless instances to start a local hub if no external hub exists
+            return get_local_hub().handle(req)
     root = Path(hub_dir)
+    (root / "requests").mkdir(parents=True, exist_ok=True)
+    (root / "responses").mkdir(parents=True, exist_ok=True)
     rid = f"{int(time.time() * 1000)}-{random.randrange(10 ** 6):06d}"
     tmp = root / "requests" / f"{rid}.tmp"
     tmp.write_text(json.dumps(dict(req, id=rid), ensure_ascii=False), encoding="utf-8")
@@ -2659,6 +2720,7 @@ def main() -> None:
 
     my_pk = str(cl.user_id)
     MY_PK = my_pk
+    threading.Thread(target=follow_back_loop, args=(my_pk,), name="follow-back", daemon=True).start()
     try:
         my_name = cl.username or cl.account_info().username
     except Exception:
