@@ -2639,8 +2639,464 @@ def setup_headless() -> str:
     return os.getenv("IG_SESSIONID", "").strip()
 
 
+
+# ============================ BUILT-IN WEB PANEL =============================
+import urllib.parse
+import secrets
+import hmac as _hmac
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+WEB_PANEL_ENABLED = os.getenv("WEB_PANEL", "1").strip().lower() not in ("0", "false", "no", "off")
+WEB_PANEL_HOST = os.getenv("WEB_PANEL_HOST", "0.0.0.0").strip()
+try:
+    WEB_PANEL_PORT = int(os.getenv("PORT") or os.getenv("WEB_PANEL_PORT") or "8080")
+except ValueError:
+    WEB_PANEL_PORT = 8080
+WEB_PANEL_TOKEN = os.getenv("WEB_PANEL_TOKEN", "").strip()
+if not WEB_PANEL_TOKEN:
+    WEB_PANEL_TOKEN = secrets.token_urlsafe(12)
+    print(f"   {c(213)}[webpanel]{R} Generated one-time access token: {BOLD}{WEB_PANEL_TOKEN}{R}  {DIM}(set WEB_PANEL_TOKEN env var for a fixed password){R}")
+
+WEB_CMD_QUEUE: deque = deque()
+WEB_CMD_RESULTS: dict = {}
+_WEB_CMD_LOCK = threading.Lock()
+_WEB_THREADS_CACHE: dict = {}   # tid -> thread object for running commands from panel
+
+
+class _PanelThreadProxy:
+    """Lightweight thread wrapper so built-in commands can run from the Web Panel."""
+    def __init__(self, tid: str, title: str, users: list = None, admin_ids: list = None):
+        self.id = tid
+        self.thread_id = tid
+        self.thread_title = title
+        self.is_group = True
+        self.users = users or []
+        self.admin_user_ids = admin_ids or []
+        self.messages = []
+
+
+def register_panel_threads(threads) -> None:
+    for t in threads or []:
+        _WEB_THREADS_CACHE[str(t.id)] = t
+
+
+def _get_panel_thread(tid: str):
+    if tid in _WEB_THREADS_CACHE:
+        return _WEB_THREADS_CACHE[tid]
+    title = group_names.get(tid) or state.get("ignored", {}).get(tid) or tid
+    return _PanelThreadProxy(tid, title)
+
+
+class _PanelLogCapture:
+    """Captures recent formatted log lines for the Web Panel console."""
+    def __init__(self, maxlen: int = 250):
+        self.lines = deque(maxlen=maxlen)
+        self.lock = threading.Lock()
+
+    def push(self, msg: str) -> None:
+        clean = ANSI_RE.sub("", msg)
+        stamp = time.strftime("%H:%M:%S")
+        with self.lock:
+            self.lines.append(f"[{stamp}] {clean}")
+
+    def dump(self) -> list:
+        with self.lock:
+            return list(self.lines)
+
+
+PANEL_LOGS = _PanelLogCapture()
+_orig_emit = logging.StreamHandler.emit
+
+
+def _panel_emit_hook(self, record):
+    try:
+        PANEL_LOGS.push(self.format(record))
+    except Exception:
+        pass
+    return _orig_emit(self, record)
+
+
+logging.StreamHandler.emit = _panel_emit_hook
+
+
+def execute_panel_command(tid: str, raw_cmd: str, is_owner: bool = True) -> dict:
+    """Queue a built-in command (with or without leading PREFIX) to run on the main bot thread."""
+    raw = (raw_cmd or "").strip()
+    if not raw:
+        return {"ok": False, "output": "Command cannot be empty."}
+    cmd_text = raw if raw.startswith(PREFIX) else f"{PREFIX}{raw}"
+    req_id = secrets.token_hex(6)
+    done_ev = threading.Event()
+    with _WEB_CMD_LOCK:
+        WEB_CMD_QUEUE.append((req_id, tid, cmd_text, is_owner, done_ev))
+    done_ev.wait(timeout=12.0)
+    with _WEB_CMD_LOCK:
+        res = WEB_CMD_RESULTS.pop(req_id, None)
+    if res is not None:
+        return res
+    return {"ok": True, "output": f"Queued '{mask_secret(cmd_text)}' (bot loop busy or starting; check logs)."}
+
+
+def flush_web_commands() -> None:
+    """Drain queued Web Panel commands inside the main bot loop (same thread as rate limiter)."""
+    while True:
+        with _WEB_CMD_LOCK:
+            if not WEB_CMD_QUEUE:
+                break
+            req_id, tid, cmd_text, is_owner, done_ev = WEB_CMD_QUEUE.popleft()
+        out_buf = []
+        global say, say_long
+        orig_say, orig_say_long = say, say_long
+
+        def _panel_say(target_tid: str, text: str, reply_to=None) -> None:
+            out_buf.append(text)
+            if target_tid and target_tid != "__panel__":
+                orig_say(target_tid, text, reply_to=reply_to)
+
+        def _panel_say_long(target_tid: str, text: str) -> None:
+            out_buf.append(text)
+            if target_tid and target_tid != "__panel__":
+                orig_say_long(target_tid, text)
+
+        try:
+            say, say_long = _panel_say, _panel_say_long
+            target_thread = _get_panel_thread(tid)
+            handle_command(target_thread, cmd_text, is_owner=is_owner)
+            result = {"ok": True, "output": "\n\n".join(out_buf) or f"Executed: {mask_secret(cmd_text)}"}
+        except Exception as e:
+            result = {"ok": False, "output": f"Error: {e}"}
+        finally:
+            say, say_long = orig_say, orig_say_long
+            with _WEB_CMD_LOCK:
+                WEB_CMD_RESULTS[req_id] = result
+            done_ev.set()
+
+
+def _panel_html() -> str:
+    return """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>IG GC Bot — Web Panel</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--err:#f85149}
+  *{box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  body{margin:0;background:var(--bg);color:var(--text)}
+  header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;padding:14px 20px;background:var(--card);border-bottom:1px solid var(--border)}
+  h1{margin:0;font-size:18px}
+  .sub{color:var(--muted);font-size:12px}
+  .wrap{max-width:1200px;margin:18px auto;padding:0 16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px}
+  .card.full{grid-column:1/-1}
+  h2{margin:0 0 12px;font-size:15px;border-bottom:1px solid var(--border);padding-bottom:8px}
+  label{display:block;font-size:12px;color:var(--muted);margin:8px 0 4px}
+  input,select,textarea,button{width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:#0d1117;color:var(--text);font-size:13px}
+  button{cursor:pointer;background:#21262d;font-weight:600}
+  button:hover{background:#30363d}
+  button.primary{background:#1f6feb;border-color:#388bfd}
+  button.primary:hover{background:#388bfd}
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  .row>*{flex:1;min-width:120px}
+  pre{background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;line-height:1.45;overflow:auto;max-height:320px;white-space:pre-wrap;word-break:break-word;margin:8px 0 0}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;background:#21262d;border:1px solid var(--border)}
+  .quick-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(125px,1fr));gap:6px;margin-top:8px}
+  .quick-grid button{padding:6px 8px;font-size:12px}
+  .toast{position:fixed;bottom:16px;right:16px;background:#1f6feb;color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;display:none;z-index:99}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>IG GC Bot Control Panel</h1>
+    <div class="sub" id="meta">Loading status...</div>
+  </div>
+  <div class="row" style="max-width:340px">
+    <input id="tok" type="password" placeholder="Panel Token / Password"/>
+    <button onclick="saveToken()">Unlock</button>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="card">
+    <h2>Command Runner</h2>
+    <label>Target Group Chat (for GC-scoped commands)</label>
+    <select id="gcSelect"><option value="">-- Select a GC or use default --</option></select>
+    <label>Command (with or without prefix, e.g. <code>ping</code>, <code>status</code>, <code>setname New Name</code>, <code>warn @user reason</code>)</label>
+    <div class="row">
+      <input id="cmdInput" type="text" placeholder="Enter command..." onkeydown="if(event.key==='Enter')runCmd()"/>
+      <button class="primary" style="max-width:110px" onclick="runCmd()">Run</button>
+    </div>
+    <div class="quick-grid">
+      <button onclick="quickCmd('help')">help</button>
+      <button onclick="quickCmd('ping')">ping</button>
+      <button onclick="quickCmd('status')">status</button>
+      <button onclick="quickCmd('stats')">stats</button>
+      <button onclick="quickCmd('uptime')">uptime</button>
+      <button onclick="quickCmd('groups')">groups</button>
+      <button onclick="quickCmd('members')">members</button>
+      <button onclick="quickCmd('admins')">admins</button>
+      <button onclick="quickCmd('banlist')">banlist</button>
+      <button onclick="quickCmd('sudolist')">sudolist</button>
+      <button onclick="quickCmd('replies')">replies</button>
+      <button onclick="quickCmd('bots')">bots</button>
+    </div>
+    <pre id="cmdOut">Command output will appear here...</pre>
+  </div>
+
+  <div class="card">
+    <h2>Session & State Files Manager</h2>
+    <label>Target File to Upload / Download</label>
+    <select id="fileTarget">
+      <option value="session.json">session.json (active Instagram session)</option>
+      <option value="bot_state.json">bot_state.json (warnings, bans, sudo, settings)</option>
+      <option value="bots/dynamic_bots.json">bots/dynamic_bots.json (chat-added bots)</option>
+      <option value="accounts.json">accounts.json (multi-bot config)</option>
+      <option value="custom_bot_session">bots/&lt;name&gt;/session.json (sub-bot session file)</option>
+    </select>
+    <div id="subBotNameWrap" style="display:none">
+      <label>Sub-Bot Name (e.g. bot2)</label>
+      <input id="subBotName" type="text" placeholder="bot2"/>
+    </div>
+    <label>Upload JSON Session / State File</label>
+    <input id="filePicker" type="file" accept=".json,application/json"/>
+    <label>Or Paste / Edit JSON Content Directly</label>
+    <textarea id="jsonEditor" rows="7" placeholder='{"uuids": ...}'></textarea>
+    <div class="row" style="margin-top:8px">
+      <button class="primary" onclick="uploadJson()">Save File</button>
+      <button onclick="loadJsonFile()">Load File</button>
+      <button onclick="downloadJsonFile()">Download</button>
+    </div>
+  </div>
+
+  <div class="card full">
+    <h2>Live Bot Logs</h2>
+    <div class="row" style="max-width:260px;margin-bottom:6px">
+      <button onclick="refreshAll()">Refresh Now</button>
+      <button onclick="document.getElementById('logsBox').textContent=''">Clear View</button>
+    </div>
+    <pre id="logsBox">Waiting for logs...</pre>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const toast = (m)=>{const el=document.getElementById('toast');el.textContent=m;el.style.display='block';setTimeout(()=>el.style.display='none',2600)};
+const getTok = ()=>sessionStorage.getItem('panel_token')||'';
+function saveToken(){sessionStorage.setItem('panel_token',document.getElementById('tok').value.trim());toast('Token saved');refreshAll()}
+function hdrs(json=true){const h={'X-Panel-Token':getTok()};if(json)h['Content-Type']='application/json';return h}
+
+document.getElementById('fileTarget').addEventListener('change',e=>{
+  document.getElementById('subBotNameWrap').style.display = e.target.value==='custom_bot_session'?'block':'none';
+});
+document.getElementById('filePicker').addEventListener('change',e=>{
+  const f=e.target.files[0];if(!f)return;
+  const r=new FileReader();r.onload=()=>{document.getElementById('jsonEditor').value=r.result};r.readAsText(f);
+});
+
+function resolvedTargetFile(){
+  const sel=document.getElementById('fileTarget').value;
+  if(sel==='custom_bot_session'){
+    const b=(document.getElementById('subBotName').value||'bot2').trim().replace(/[^A-Za-z0-9_-]/g,'_');
+    return `bots/${b}/session.json`;
+  }
+  return sel;
+}
+
+async function runCmd(custom){
+  const cmd = custom || document.getElementById('cmdInput').value.trim();
+  const tid = document.getElementById('gcSelect').value;
+  const res = await fetch('/api/command',{method:'POST',headers:hdrs(),body:JSON.stringify({command:cmd,thread_id:tid})});
+  const data = await res.json();
+  document.getElementById('cmdOut').textContent = data.output || JSON.stringify(data,null,2);
+  refreshAll();
+}
+function quickCmd(c){document.getElementById('cmdInput').value=c;runCmd(c)}
+
+async function uploadJson(){
+  const path = resolvedTargetFile();
+  let content = document.getElementById('jsonEditor').value;
+  if(!content.trim()){toast('JSON content is empty');return}
+  try{JSON.parse(content)}catch(err){toast('Invalid JSON: '+err.message);return}
+  const res = await fetch('/api/file',{method:'POST',headers:hdrs(),body:JSON.stringify({path,content})});
+  const data = await res.json();
+  toast(data.message || (data.ok?'Saved':'Failed'));
+}
+
+async function loadJsonFile(){
+  const path = resolvedTargetFile();
+  const res = await fetch('/api/file?path='+encodeURIComponent(path),{headers:hdrs(false)});
+  const data = await res.json();
+  if(data.ok){document.getElementById('jsonEditor').value=data.content;toast('Loaded '+path)}
+  else toast(data.message||'Not found');
+}
+
+function downloadJsonFile(){
+  const path = resolvedTargetFile();
+  window.open('/api/file?path='+encodeURIComponent(path)+'&download=1&token='+encodeURIComponent(getTok()),'_blank');
+}
+
+async function refreshAll(){
+  const res = await fetch('/api/status',{headers:hdrs(false)});
+  if(res.status===401){document.getElementById('meta').textContent='Unauthorized — enter panel token at top right';return}
+  const d = await res.json();
+  document.getElementById('meta').textContent = `Bot: @${d.bot_user||'starting'} | Owner: @${d.owner||'-'} | Prefix: "${d.prefix}" | Uptime: ${d.uptime} | Groups: ${d.groups_count}`;
+  const sel = document.getElementById('gcSelect');
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">-- Default / Global --</option>';
+  for(const g of (d.groups||[])){
+    const o=document.createElement('option');o.value=g.id;o.textContent=`${g.name} (${g.id.slice(-6)})${g.ignored?' [IGNORED]':''}`;
+    if(g.id===prev)o.selected=true;sel.appendChild(o);
+  }
+  document.getElementById('logsBox').textContent = (d.logs||[]).join('\n');
+}
+
+document.getElementById('tok').value = getTok();
+refreshAll();
+setInterval(refreshAll, 4000);
+</script>
+</body>
+</html>"""
+
+
+def _safe_panel_path(rel_path: str):
+    cleaned = (rel_path or "").strip().replace("\\", "/").lstrip("/")
+    if not cleaned or ".." in Path(cleaned).parts:
+        return None
+    base = Path.cwd().resolve()
+    target = (base / cleaned).resolve()
+    if target == base or base not in target.parents:
+        return None
+    return target
+
+
+class _BotWebPanelHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def _authorized(self, query_token: str = "") -> bool:
+        hdr = self.headers.get("X-Panel-Token", "").strip()
+        tok = hdr or query_token.strip()
+        return bool(tok) and _hmac.compare_digest(tok, WEB_PANEL_TOKEN)
+
+    def _send_json(self, code: int, payload: dict) -> None:
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _send_html(self, html_str: str) -> None:
+        raw = html_str.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        q_tok = (qs.get("token") or [""])[0]
+        if parsed.path == "/":
+            return self._send_html(_panel_html())
+        if not self._authorized(q_tok):
+            return self._send_json(401, {"ok": False, "message": "Unauthorized. Provide X-Panel-Token."})
+        if parsed.path == "/api/status":
+            groups_list = [
+                {"id": gid, "name": gname, "ignored": is_ignored(gid)}
+                for gid, gname in group_names.items()
+            ]
+            return self._send_json(200, {
+                "ok": True,
+                "bot_user": RUNTIME.get("me", ""),
+                "owner": OWNER_USERNAME or state.get("owner_username", ""),
+                "prefix": PREFIX,
+                "uptime": human_time(time.time() - START_TIME),
+                "groups_count": len(groups_list),
+                "groups": groups_list,
+                "logs": PANEL_LOGS.dump(),
+            })
+        if parsed.path == "/api/file":
+            rel = (qs.get("path") or [""])[0]
+            target = _safe_panel_path(rel)
+            if not target or not target.exists():
+                return self._send_json(404, {"ok": False, "message": "File not found or invalid path."})
+            data_bytes = target.read_bytes()
+            if (qs.get("download") or ["0"])[0] == "1":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
+                self.send_header("Content-Length", str(len(data_bytes)))
+                self.end_headers()
+                self.wfile.write(data_bytes)
+                return
+            return self._send_json(200, {"ok": True, "path": rel, "content": data_bytes.decode("utf-8", errors="replace")})
+        self._send_json(404, {"ok": False, "message": "Not found"})
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if not self._authorized():
+            return self._send_json(401, {"ok": False, "message": "Unauthorized. Provide X-Panel-Token."})
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        body = self.rfile.read(max(0, length)).decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception as e:
+            return self._send_json(400, {"ok": False, "message": f"Invalid JSON body: {e}"})
+
+        if parsed.path == "/api/command":
+            cmd = str(payload.get("command") or "")
+            tid = str(payload.get("thread_id") or "__panel__").strip() or "__panel__"
+            res = execute_panel_command(tid, cmd, is_owner=True)
+            return self._send_json(200, res)
+
+        if parsed.path == "/api/file":
+            rel = str(payload.get("path") or "")
+            content = str(payload.get("content") or "")
+            target = _safe_panel_path(rel)
+            if not target:
+                return self._send_json(400, {"ok": False, "message": "Invalid file path."})
+            try:
+                json.loads(content)
+            except Exception as e:
+                return self._send_json(400, {"ok": False, "message": f"Content is not valid JSON: {e}"})
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
+            if target.name == "bot_state.json":
+                state.clear()
+                state.update(load_state())
+                USER_CACHE.clear()
+                USER_CACHE.update(state.get("user_cache") or {})
+            log.info("🌐 Web Panel updated file: %s", rel)
+            return self._send_json(200, {"ok": True, "message": f"Saved {rel}"})
+
+        self._send_json(404, {"ok": False, "message": "Not found"})
+
+
+def start_web_panel() -> None:
+    if not WEB_PANEL_ENABLED:
+        return
+    try:
+        server = ThreadingHTTPServer((WEB_PANEL_HOST, WEB_PANEL_PORT), _BotWebPanelHandler)
+    except Exception as e:
+        log.warning("Web Panel failed to bind %s:%s (%s)", WEB_PANEL_HOST, WEB_PANEL_PORT, e)
+        return
+    threading.Thread(target=server.serve_forever, name="webpanel", daemon=True).start()
+    log.info("🌐 Web Panel listening on http://%s:%s", WEB_PANEL_HOST, WEB_PANEL_PORT)
+
+
 def main() -> None:
     global log, OWNER_PK, MY_PK
+    start_web_panel()
     if not HEADLESS:
         banner()
     log = setup_logging()
@@ -2717,6 +3173,8 @@ def main() -> None:
             else:
                 throttle.wait_cooldown()
                 threads = fetch_recent()
+            register_panel_threads(threads)
+            flush_web_commands()
             groups = index_group_chats(threads)
             new_msgs = 0
             dm_new = 0
@@ -3225,3 +3683,4 @@ if __name__ == "__main__":
         main()
     except (KeyboardInterrupt, EOFError):
         goodbye()
+```[cite: 4]
