@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ρ 𝕣 ꪜ 𝕣 अब्बू ☽  BOT  -  Instagram Group Chat Bot (instagrapi)
+ρ 𝕣 ꪜ 𝕣 अब्बू ☽  BOT  -  Instagram Group Chat Bot (instagrapi + FastAPI Web Panel)
 
 Just run:   python ig_gc_bot.py
 
@@ -30,32 +30,6 @@ STAYING UNDER INSTAGRAM'S RATE LIMITS (all optional, all environment variables)
   API_DELAY_MIN / MAX   random pause before every API call (default 0.3-0.9s)
   SEND_CAP_PER_MIN      most messages/actions per minute (default 20)
   Type  rate  in the terminal to see cool-down, poll speed and how many requests were sent.
-
-MULTIPLE BOT ACCOUNTS (no pasting in the terminal)
-  python ig_gc_bot_updated.py --init     -> creates a template accounts.json
-  Put each bot's sessionid (or "sessionid_env") in it, then just run the script again.
-  Every account runs as its own process in bots/<name>/ with its own session + settings,
-  and its logs are shown with a [name] prefix. Use --single to ignore accounts.json
-  and run one bot with the usual prompts.
-
-ADD MORE BOTS FROM CHAT (no terminal pasting at all)
-  As the owner, send this to any bot (in a GC it watches, or - safer - in a private DM with the bot):
-      !addbot <sessionid>                     -> new bot starts (auto name bot2, bot3 ...)
-      !addbot <sessionid> mybot               -> choose the name
-      !addbot <sessionid> mybot .             -> choose the name AND a different command prefix
-      !addbot login <username> <password> [name] [prefix]   -> same, with username + password
-                                                 (accounts with 2FA: use a sessionid instead)
-      !bots                                   -> list running bots
-      !stopbot <name>                         -> stop one (and forget it)
-  The new bot gets the same owner. Its session is saved in bots/<name>/, so it comes back by
-  itself the next time you start the script. UNSEND the message after sending it: a sessionid
-  is a password and everybody in a GC can read it.
-
-NOTES
-- The bot account must be a group ADMIN to kick/add people.
-- Use a separate account for the bot. Automation violates Instagram's ToS.
-- Instagram doesn't let bots delete other people's messages, so moderation
-  works through warnings + kicks.
 """
 
 # ============================ AUTO-INSTALL ===================================
@@ -66,12 +40,14 @@ import subprocess
 import sys
 
 if os.name == "nt":
-    os.system("")  # enables ANSI colours in the Windows console
+    os.system("")
 
-REQUIRED = {  # import name -> pip name
+REQUIRED = {
     "instagrapi": "instagrapi",
     "psutil": "psutil",
     "colorama": "colorama",
+    "fastapi": "fastapi",
+    "uvicorn": "uvicorn",
 }
 
 
@@ -89,7 +65,7 @@ def ensure_packages() -> None:
         subprocess.call([sys.executable, "-m", "ensurepip", "--upgrade"])
     cmd = [sys.executable, "-m", "pip", "install", "--upgrade", *missing]
     code = subprocess.call(cmd)
-    if code != 0:  # externally-managed environments (Debian/Ubuntu/Termux etc.)
+    if code != 0:
         code = subprocess.call(cmd + ["--break-system-packages"])
     if code != 0:
         sys.exit(f"{tag} \033[38;5;196mpip install failed.\033[0m Install manually: pip install " + " ".join(missing))
@@ -114,8 +90,10 @@ import getpass
 import logging
 import platform
 import shutil
+import secrets
 import threading
 import unicodedata
+import urllib.parse
 import datetime as dt
 from collections import deque
 from pathlib import Path
@@ -123,6 +101,10 @@ from urllib.parse import unquote
 
 import psutil
 import colorama
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from pydantic import BaseModel
+import uvicorn
 from instagrapi import Client
 from instagrapi.exceptions import (
     LoginRequired, ChallengeRequired, ClientThrottledError, PleaseWaitFewMinutes,
@@ -132,7 +114,6 @@ import instagrapi.exceptions as igx
 
 
 def _exc_class(name: str):
-    """An instagrapi exception class, or a harmless stand-in on versions that don't have it."""
     return getattr(igx, name, None) or type(name, (Exception,), {})
 
 
@@ -151,11 +132,11 @@ except Exception:
 
 # ================================ CONFIG =====================================
 PREFIX = os.getenv("PREFIX", "!")
-OWNER_USERNAME = ""                 # filled in from the terminal prompt
-OWNER_PK = ""                       # owner's user id (resolved at login)
-MY_PK = ""                          # bot account's user id (resolved at login)
+OWNER_USERNAME = ""
+OWNER_PK = ""
+MY_PK = ""
 BOT_NAME = "ρ 𝕣 ꪜ 𝕣 अब्बू ☽"
-HEADLESS = os.getenv("HEADLESS") == "1"   # set by the multi-account launcher: no prompts / console
+HEADLESS = os.getenv("HEADLESS") == "1"
 
 SESSION_FILE = Path("session.json")
 STATE_FILE = Path("bot_state.json")
@@ -168,7 +149,6 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# Polling faster than every 2s is the #1 reason bots get rate-limited, so that is the floor.
 POLL_MIN = max(2.0, _env_float("POLL_MIN", 3.0))
 POLL_MAX = max(POLL_MIN + 1.0, _env_float("POLL_MAX", 5.0))
 IDLE_AFTER = 20
@@ -282,7 +262,7 @@ def print_credits() -> None:
         print("   " + BOLD + rainbow(line, offset=i * 3, step=1))
     print("   " + rainbow("─" * w, offset=4))
     print(f"   {c(213)}{BOLD}Crafted by{R}  {c(250)}➜{R}  {BOLD}{rainbow(BOT_NAME, offset=7)}")
-    print(f"   {c(213)}{BOLD}Engine    {R}  {c(250)}➜{R}  {c(250)}instagrapi · psutil · colorama{R}")
+    print(f"   {c(213)}{BOLD}Engine    {R}  {c(250)}➜{R}  {c(250)}instagrapi · psutil · colorama · fastapi{R}")
     print(f"   {c(213)}{BOLD}Made with {R}  {c(250)}➜{R}  {c(196)}♥{R} {c(250)}for Instagram group chats{R}")
     print("   " + rainbow("─" * w, offset=10))
     print()
@@ -380,6 +360,7 @@ def setup_logging() -> logging.Logger:
     root.handlers[:] = [handler]
     root.setLevel(logging.INFO)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn").setLevel(logging.WARNING)
     return logging.getLogger("bot")
 
 
@@ -413,6 +394,8 @@ DEFAULT_STATE = {
     "user_cache": {},
 }
 
+_STATE_LOCK = threading.RLock()
+
 
 def load_state() -> dict:
     st = copy.deepcopy(DEFAULT_STATE)
@@ -425,7 +408,8 @@ def load_state() -> dict:
 
 
 def save_state() -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    with _STATE_LOCK:
+        STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 state = load_state()
@@ -437,8 +421,9 @@ def feature_on(tid: str, feature: str) -> bool:
 
 
 def set_feature(tid: str, feature: str, value: bool) -> None:
-    state["mod"].setdefault(tid, {})[feature] = value
-    save_state()
+    with _STATE_LOCK:
+        state["mod"].setdefault(tid, {})[feature] = value
+        save_state()
 
 
 RESYNC: set = set()
@@ -449,21 +434,23 @@ def is_ignored(tid: str) -> bool:
 
 
 def ignore_group(tid: str, name: str = "") -> bool:
-    if tid in state["ignored"]:
-        return False
-    state["ignored"][tid] = name or group_names.get(tid) or tid[-6:]
-    known_members.pop(tid, None)
-    save_state()
+    with _STATE_LOCK:
+        if tid in state["ignored"]:
+            return False
+        state["ignored"][tid] = name or group_names.get(tid) or tid[-6:]
+        known_members.pop(tid, None)
+        save_state()
     log.warning("🙈 now IGNORING '%s' (…%s)", state["ignored"][tid], tid[-6:])
     return True
 
 
 def unignore_group(tid: str) -> bool:
-    name = state["ignored"].pop(tid, None)
-    if name is None:
-        return False
-    RESYNC.add(tid)
-    save_state()
+    with _STATE_LOCK:
+        name = state["ignored"].pop(tid, None)
+        if name is None:
+            return False
+        RESYNC.add(tid)
+        save_state()
     log.info("👀 no longer ignoring '%s' (…%s)", name, tid[-6:])
     return True
 
@@ -529,8 +516,9 @@ def _save_session(user: str) -> None:
         os.chmod(SESSION_FILE, 0o600)
     except OSError:
         pass
-    state["session_user"] = (user or "").lstrip("@").lower()
-    save_state()
+    with _STATE_LOCK:
+        state["session_user"] = (user or "").lstrip("@").lower()
+        save_state()
 
 
 def _login_sid(sid: str) -> None:
@@ -551,8 +539,9 @@ def _login_sid(sid: str) -> None:
         apply_proxy()
         cl.login_by_sessionid(sid)
     _save_session(getattr(cl, "username", "") or "")
-    state["login_method"] = "session"
-    save_state()
+    with _STATE_LOCK:
+        state["login_method"] = "session"
+        save_state()
     log.info("🔐 Logged in via sessionid")
 
 
@@ -591,9 +580,10 @@ def _login_password(username: str, password: str) -> None:
     else:
         raise RuntimeError("login did not complete")
     _save_session(username)
-    state["login_method"] = "password"
-    state["login_username"] = username
-    save_state()
+    with _STATE_LOCK:
+        state["login_method"] = "password"
+        state["login_username"] = username
+        save_state()
     log.info("🔐 Logged in as @%s with username/password", username)
 
 
@@ -668,6 +658,22 @@ def login_hint(exc: Exception) -> str:
 RL_WORDS = ("1404006", "item_ack", "wait a few minutes", "please wait", "try again later",
             "rate limit", "throttl", "feedback_required", "too many requests")
 
+STOP = threading.Event()
+_WAKE_PANEL = threading.Event()
+
+
+def wake_panel_loop() -> None:
+    _WAKE_PANEL.set()
+
+
+def sleep_interruptible(seconds: float) -> None:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while not STOP.is_set() and time.monotonic() < deadline:
+        if _WAKE_PANEL.is_set():
+            _WAKE_PANEL.clear()
+            break
+        STOP.wait(min(0.25, max(0.01, deadline - time.monotonic())))
+
 
 def is_rate_limited(exc: Exception) -> bool:
     if isinstance(exc, (ClientThrottledError, PleaseWaitFewMinutes, RateLimitError, FeedbackRequired)):
@@ -676,6 +682,10 @@ def is_rate_limited(exc: Exception) -> bool:
         return True
     msg = str(exc).lower()
     return any(w in msg for w in RL_WORDS)
+
+
+def human_time(seconds: float) -> str:
+    return str(dt.timedelta(seconds=int(seconds)))
 
 
 class Throttle:
@@ -727,8 +737,8 @@ class Throttle:
         rem = self.remaining()
         if rem > 0:
             log.warning("⏳ cooling down for %s before the next request...", human_time(rem))
-            STOP.wait(rem)
-            if not STOP.is_set():
+            sleep_interruptible(rem)
+            if not STOP.is_set() and self.remaining() <= 0:
                 log.info("▶️  cool-down over, resuming")
 
     def wait_turn(self) -> None:
@@ -942,11 +952,12 @@ def resolve_user(arg: str):
             throttle.hit(e, "user lookup")
         return None, None
     USER_CACHE[name] = pk
-    cache = state["user_cache"]
-    cache[name] = pk
-    while len(cache) > 500:
-        cache.pop(next(iter(cache)))
-    save_state()
+    with _STATE_LOCK:
+        cache = state["user_cache"]
+        cache[name] = pk
+        while len(cache) > 500:
+            cache.pop(next(iter(cache)))
+        save_state()
     return pk, name
 
 
@@ -1055,10 +1066,6 @@ def human_bytes(n: float) -> str:
     return f"{n:.1f}PB"
 
 
-def human_time(seconds: float) -> str:
-    return str(dt.timedelta(seconds=int(seconds)))
-
-
 def system_stats() -> str:
     cpu = psutil.cpu_percent(interval=0.1)
     freq = psutil.cpu_freq()
@@ -1159,19 +1166,21 @@ def set_group_name(thread_id: str, title: str):
 
 
 def lock_name(tid: str, name: str) -> None:
-    state["name_lock"][tid] = _norm_name(name)
-    for d in (NAME_FAILS, NAME_NEXT_TRY, NAME_STUCK):
-        d.pop(tid, None)
-    save_state()
+    with _STATE_LOCK:
+        state["name_lock"][tid] = _norm_name(name)
+        for d in (NAME_FAILS, NAME_NEXT_TRY, NAME_STUCK):
+            d.pop(tid, None)
+        save_state()
     log.warning("🔒 GC name locked to '%s' in …%s", name, tid[-6:])
 
 
 def unlock_name(tid: str) -> bool:
-    for d in (NAME_FAILS, NAME_NEXT_TRY, NAME_STUCK):
-        d.pop(tid, None)
-    if state["name_lock"].pop(tid, None) is None:
-        return False
-    save_state()
+    with _STATE_LOCK:
+        for d in (NAME_FAILS, NAME_NEXT_TRY, NAME_STUCK):
+            d.pop(tid, None)
+        if state["name_lock"].pop(tid, None) is None:
+            return False
+        save_state()
     log.warning("🔓 GC name unlocked in …%s", tid[-6:])
     return True
 
@@ -1226,21 +1235,26 @@ def enforce_name_lock(thread) -> None:
 # ================================ WARNINGS ===================================
 def add_warning(thread, pk: str, uname: str, reason: str, *, kick_allowed: bool = True) -> None:
     tid = str(thread.id)
-    w = state["warnings"].setdefault(tid, {})
-    mx = state["max_warns"]
-    w[pk] = min(w.get(pk, 0) + 1, mx) if not kick_allowed else w.get(pk, 0) + 1
-    count = w[pk]
-    log.warning("⚠️  warn @%s %d/%d in '%s' — %s", uname, count, mx, group_name(thread), reason)
+    with _STATE_LOCK:
+        w = state["warnings"].setdefault(tid, {})
+        mx = state["max_warns"]
+        w[pk] = min(w.get(pk, 0) + 1, mx) if not kick_allowed else w.get(pk, 0) + 1
+        count = w[pk]
+        if count >= mx and kick_allowed:
+            w.pop(pk, None)
+            save_state()
+            should_kick = True
+        else:
+            save_state()
+            should_kick = False
 
-    if count >= mx and kick_allowed:
-        w.pop(pk, None)
-        save_state()
+    log.warning("⚠️  warn @%s %d/%d in '%s' — %s", uname, count, mx, group_name(thread), reason)
+    if should_kick:
         if kick_user(tid, pk):
             say(tid, f"🚫 @{uname} reached {mx}/{mx} warnings ({reason}) and was removed.")
         else:
             say(tid, f"🚫 @{uname} reached {mx}/{mx} warnings ({reason}) but I couldn't remove them (am I admin?).")
     else:
-        save_state()
         suffix = " (admin/owner: no automatic removal)" if count >= mx and not kick_allowed else ""
         say(tid, f"⚠️ @{uname} warning {count}/{mx}: {reason}{suffix}")
 
@@ -1728,16 +1742,19 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
             return say(tid, user_not_found())
         if blocked_target(tid, is_owner, pk, name, "ban"):
             return
-        state["banned"][pk] = name
-        save_state()
+        with _STATE_LOCK:
+            state["banned"][pk] = name
+            save_state()
         kick_user(tid, pk)
         say(tid, f"🔨 Banned @{name}. They'll be auto-kicked if re-added.")
 
     elif cmd == "unban":
         pk, name = resolve_user(arg.split()[0]) if arg else (None, None)
-        if pk and pk in state["banned"]:
-            del state["banned"][pk]
-            save_state()
+        with _STATE_LOCK:
+            removed = pk and state["banned"].pop(pk, None) is not None
+            if removed:
+                save_state()
+        if removed:
             say(tid, f"✅ Unbanned @{name}")
         else:
             say(tid, "❌ That user isn't banned.")
@@ -1758,20 +1775,25 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
 
     elif cmd == "unwarn":
         pk, name, _ = split_target(arg)
-        w = state["warnings"].get(tid, {})
-        if pk and w.get(pk):
-            w[pk] -= 1
-            if w[pk] <= 0:
-                w.pop(pk, None)
-            save_state()
-            say(tid, f"✅ Removed a warning from @{name} ({w.get(pk, 0)}/{state['max_warns']})")
-        else:
-            say(tid, "❌ That user has no warnings.")
+        with _STATE_LOCK:
+            w = state["warnings"].get(tid, {})
+            if pk and w.get(pk):
+                w[pk] -= 1
+                if w[pk] <= 0:
+                    w.pop(pk, None)
+                save_state()
+                rem = w.get(pk, 0)
+                say(tid, f"✅ Removed a warning from @{name} ({rem}/{state['max_warns']})")
+                return
+        say(tid, "❌ That user has no warnings.")
 
     elif cmd == "clearwarns":
         pk, name, _ = split_target(arg)
-        if pk and state["warnings"].get(tid, {}).pop(pk, None) is not None:
-            save_state()
+        with _STATE_LOCK:
+            cleared = pk and state["warnings"].get(tid, {}).pop(pk, None) is not None
+            if cleared:
+                save_state()
+        if cleared:
             say(tid, f"🧹 Cleared warnings for @{name}")
         else:
             say(tid, "❌ That user has no warnings.")
@@ -1791,8 +1813,9 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
 
     elif cmd == "maxwarns":
         if arg.isdigit() and 1 <= int(arg) <= 20:
-            state["max_warns"] = int(arg)
-            save_state()
+            with _STATE_LOCK:
+                state["max_warns"] = int(arg)
+                save_state()
             say(tid, f"✅ Users are removed at {arg} warnings.")
         else:
             say(tid, f"Usage: {PREFIX}maxwarns <1-20>")
@@ -1803,8 +1826,9 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
             set_feature(tid, "antispam", a[0] == "on")
             say(tid, f"Anti-spam {'enabled ✅' if a[0] == 'on' else 'disabled ❌'}")
         elif len(a) == 3 and a[0] == "set" and a[1].isdigit() and a[2].isdigit():
-            state["spam_msgs"], state["spam_secs"] = max(2, int(a[1])), max(2, int(a[2]))
-            save_state()
+            with _STATE_LOCK:
+                state["spam_msgs"], state["spam_secs"] = max(2, int(a[1])), max(2, int(a[2]))
+                save_state()
             say(tid, f"✅ Flood limit: {state['spam_msgs']} messages in {state['spam_secs']}s")
         else:
             say(tid, f"Usage: {PREFIX}antispam on|off  or  {PREFIX}antispam set <msgs> <secs>")
@@ -1829,13 +1853,17 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
         kw, reply = (s.strip() for s in arg.split("|", 1))
         if not kw or not reply:
             return say(tid, f"Usage: {PREFIX}addreply <keyword> | <reply>")
-        state["autoreplies"][kw.lower()] = reply
-        save_state()
+        with _STATE_LOCK:
+            state["autoreplies"][kw.lower()] = reply
+            save_state()
         say(tid, f"✅ I'll reply to '{kw.lower()}'")
 
     elif cmd == "delreply":
-        if state["autoreplies"].pop(arg.lower(), None) is not None:
-            save_state()
+        with _STATE_LOCK:
+            removed = state["autoreplies"].pop(arg.lower(), None) is not None
+            if removed:
+                save_state()
+        if removed:
             say(tid, f"🗑️ Removed reply for '{arg.lower()}'")
         else:
             say(tid, "❌ No such keyword.")
@@ -1856,22 +1884,28 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
             return say(tid, user_not_found())
         if blocked_target(tid, is_owner, pk, name, "target"):
             return
-        state["user_replies"].setdefault(tid, {})[pk] = {"name": name, "text": text_}
-        save_state()
+        with _STATE_LOCK:
+            state["user_replies"].setdefault(tid, {})[pk] = {"name": name, "text": text_}
+            save_state()
         log.warning("🎯 targeted reply set for @%s in '%s'", name, group_name(thread))
         say(tid, f"🎯 OK - I'll reply to @{name} in this GC (at most once every "
                  f"{state['user_reply_cooldown']}s) with:\n{text_}")
 
     elif cmd == "stopreply":
-        rules = state["user_replies"].get(tid, {})
-        if arg.lower() == "all":
-            n = len(rules)
-            state["user_replies"][tid] = {}
-            save_state()
-            return say(tid, f"🛑 Stopped all targeted replies in this GC ({n}).")
+        with _STATE_LOCK:
+            rules = state["user_replies"].get(tid, {})
+            if arg.lower() == "all":
+                n = len(rules)
+                state["user_replies"][tid] = {}
+                save_state()
+                return say(tid, f"🛑 Stopped all targeted replies in this GC ({n}).")
         pk, name = resolve_user(arg.split()[0]) if arg else (None, None)
-        if pk and rules.pop(pk, None) is not None:
-            save_state()
+        with _STATE_LOCK:
+            rules = state["user_replies"].get(tid, {})
+            removed = pk and rules.pop(pk, None) is not None
+            if removed:
+                save_state()
+        if removed:
             say(tid, f"🛑 No longer replying to @{name}.")
         else:
             say(tid, f"❌ No targeted reply for that user. Usage: {PREFIX}stopreply @username|all")
@@ -1884,8 +1918,9 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
 
     elif cmd == "replycooldown":
         if arg.isdigit() and 5 <= int(arg) <= 3600:
-            state["user_reply_cooldown"] = int(arg)
-            save_state()
+            with _STATE_LOCK:
+                state["user_reply_cooldown"] = int(arg)
+                save_state()
             say(tid, f"✅ Targeted replies: at most one every {arg}s per user.")
         else:
             say(tid, f"Usage: {PREFIX}replycooldown <5-3600>  (now {state['user_reply_cooldown']}s)")
@@ -1907,22 +1942,28 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
             return
         if pk == MY_PK:
             return say(tid, "😅 I won't target myself.")
-        state["user_reacts"].setdefault(tid, {})[pk] = {"name": name, "emojis": emojis}
-        save_state()
+        with _STATE_LOCK:
+            state["user_reacts"].setdefault(tid, {})[pk] = {"name": name, "emojis": emojis}
+            save_state()
         log.warning("😀 auto-react set for @%s in '%s': %s", name, group_name(thread), " ".join(emojis))
         say(tid, f"😀 OK - I'll react to @{name}'s messages in this GC with {' '.join(emojis)} "
                  f"(at most once every {state['user_react_cooldown']}s).")
 
     elif cmd == "stopreact":
-        rules = state["user_reacts"].get(tid, {})
-        if arg.lower() == "all":
-            n = len(rules)
-            state["user_reacts"][tid] = {}
-            save_state()
-            return say(tid, f"🛑 Stopped all auto-reactions in this GC ({n}).")
+        with _STATE_LOCK:
+            rules = state["user_reacts"].get(tid, {})
+            if arg.lower() == "all":
+                n = len(rules)
+                state["user_reacts"][tid] = {}
+                save_state()
+                return say(tid, f"🛑 Stopped all auto-reactions in this GC ({n}).")
         pk, name = resolve_user(arg.split()[0]) if arg else (None, None)
-        if pk and rules.pop(pk, None) is not None:
-            save_state()
+        with _STATE_LOCK:
+            rules = state["user_reacts"].get(tid, {})
+            removed = pk and rules.pop(pk, None) is not None
+            if removed:
+                save_state()
+        if removed:
             say(tid, f"🛑 No longer reacting to @{name}.")
         else:
             say(tid, f"❌ No auto-reaction for that user. Usage: {PREFIX}stopreact @username|all")
@@ -1935,8 +1976,9 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
 
     elif cmd == "reactcooldown":
         if arg.isdigit() and 0 <= int(arg) <= 600:
-            state["user_react_cooldown"] = int(arg)
-            save_state()
+            with _STATE_LOCK:
+                state["user_react_cooldown"] = int(arg)
+                save_state()
             say(tid, f"✅ Auto-reactions: at most one every {arg}s per user." if int(arg)
                 else "✅ Auto-reactions: react to every message (when the rate budget allows).")
         else:
@@ -1949,8 +1991,9 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
 
     elif cmd == "welcome":
         if arg.lower() in ("on", "off"):
-            state["welcome_enabled"][tid] = arg.lower() == "on"
-            save_state()
+            with _STATE_LOCK:
+                state["welcome_enabled"][tid] = arg.lower() == "on"
+                save_state()
             say(tid, f"Welcome messages {'enabled ✅' if arg.lower() == 'on' else 'disabled ❌'}")
         else:
             say(tid, f"Usage: {PREFIX}welcome on|off")
@@ -1958,8 +2001,9 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
     elif cmd == "setwelcome":
         if not arg:
             return say(tid, f"Usage: {PREFIX}setwelcome <text>  (use {{mentions}} and {{group}})")
-        state["welcome_text"] = arg
-        save_state()
+        with _STATE_LOCK:
+            state["welcome_text"] = arg
+            save_state()
         say(tid, "✅ Welcome message updated.")
 
     elif cmd == "say":
@@ -2078,10 +2122,11 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
             return say(tid, "👑 That's you - you're already the owner.")
         if pk == MY_PK:
             return say(tid, "😅 I can't be my own sudo.")
-        if pk in state["sudo"]:
-            return say(tid, f"ℹ️ @{name} already has sudo access.")
-        state["sudo"][pk] = name
-        save_state()
+        with _STATE_LOCK:
+            if pk in state["sudo"]:
+                return say(tid, f"ℹ️ @{name} already has sudo access.")
+            state["sudo"][pk] = name
+            save_state()
         log.warning("🔑 sudo granted to @%s", name)
         say(tid, f"🔑 @{name} can now control the bot (everything except the 👑 owner-only commands).")
 
@@ -2089,8 +2134,11 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
         if not arg:
             return say(tid, f"Usage: {PREFIX}delsudo @username")
         pk, name = resolve_user(arg.split()[0])
-        if pk and state["sudo"].pop(pk, None) is not None:
-            save_state()
+        with _STATE_LOCK:
+            removed = pk and state["sudo"].pop(pk, None) is not None
+            if removed:
+                save_state()
+        if removed:
             log.warning("🔑 sudo revoked from @%s", name)
             say(tid, f"🗝️ @{name} no longer has sudo access.")
         else:
@@ -2157,8 +2205,9 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
         try:
             paced(cl.private_request, f"direct_v2/threads/{tid}/leave/", data={"_uuid": cl.uuid})
             log.warning("🚪 left group '%s'", group_name(thread))
-            if state["name_lock"].pop(tid, None) is not None:
-                save_state()
+            with _STATE_LOCK:
+                if state["name_lock"].pop(tid, None) is not None:
+                    save_state()
         except Exception as e:
             log.error("leave failed: %s", e)
 
@@ -2167,7 +2216,6 @@ def handle_command(thread, text: str, is_owner: bool = True) -> None:
 
 
 # ============================ TERMINAL HELP / CONSOLE ========================
-STOP = threading.Event()
 RUNTIME = {"me": "", "polls": 0, "groups": 0, "msgs": 0, "verbose": False}
 group_names: dict = {}
 
@@ -2300,12 +2348,16 @@ def console_sudo(carg: str) -> None:
             if pk == OWNER_PK:
                 print(f"   {c(220)}• that's the owner already{R}")
             else:
-                state["sudo"][pk] = name
-                save_state()
+                with _STATE_LOCK:
+                    state["sudo"][pk] = name
+                    save_state()
                 print(f"   {c(46)}🔑 sudo granted to @{name}{R}")
         else:
-            if state["sudo"].pop(pk, None) is not None:
-                save_state()
+            with _STATE_LOCK:
+                removed = state["sudo"].pop(pk, None) is not None
+                if removed:
+                    save_state()
+            if removed:
                 print(f"   {c(46)}🗝️  sudo revoked from @{name}{R}")
             else:
                 print(f"   {c(220)}• @{name} wasn't a sudo user{R}")
@@ -2587,7 +2639,8 @@ def setup_prompts() -> str:
 
     OWNER_USERNAME = ask("Owner username (you)",
                          default=os.getenv("OWNER_USERNAME") or state.get("owner_username", "")).lstrip("@").lower()
-    state["owner_username"] = OWNER_USERNAME
+    with _STATE_LOCK:
+        state["owner_username"] = OWNER_USERNAME
 
     print(f"\n   {DIM}Welcome text placeholders: {{mentions}} = new members, {{group}} = group name{R}")
     print(f"   {DIM}Type \\n for a new line.{R}")
@@ -2598,8 +2651,9 @@ def setup_prompts() -> str:
             break
         except Exception:
             print(f"   {c(196)}✖ Invalid placeholder. Only {{mentions}} and {{group}} are allowed.{R}")
-    state["welcome_text"] = wt
-    save_state()
+    with _STATE_LOCK:
+        state["welcome_text"] = wt
+        save_state()
     print()
     return sid
 
@@ -2632,25 +2686,23 @@ def setup_headless() -> str:
     OWNER_USERNAME = (os.getenv("OWNER_USERNAME", "") or state.get("owner_username", "")).lstrip("@").lower()
     if not OWNER_USERNAME:
         sys.exit("OWNER_USERNAME is required")
-    state["owner_username"] = OWNER_USERNAME
-    wt = os.getenv("WELCOME_TEXT", "").replace("\\n", "\n")
-    if wt:
-        try:
-            wt.format(mentions="@x", group="y")
-            state["welcome_text"] = wt
-        except Exception:
-            log.warning("WELCOME_TEXT has an invalid placeholder - keeping the saved welcome text")
-    save_state()
+    with _STATE_LOCK:
+        state["owner_username"] = OWNER_USERNAME
+        wt = os.getenv("WELCOME_TEXT", "").replace("\\n", "\n")
+        if wt:
+            try:
+                wt.format(mentions="@x", group="y")
+                state["welcome_text"] = wt
+            except Exception:
+                log.warning("WELCOME_TEXT has an invalid placeholder - keeping the saved welcome text")
+        save_state()
     CREDS.update(username=os.getenv("IG_USERNAME", "").strip().lstrip("@"), password=os.getenv("IG_PASSWORD", ""),
                  totp=os.getenv("IG_TOTP_SEED", "").strip(), code=os.getenv("IG_2FA_CODE", "").strip())
     return os.getenv("IG_SESSIONID", "").strip()
 
 
-# ============================ BUILT-IN WEB PANEL =============================
-import urllib.parse
-import secrets
-import hmac as _hmac
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+# ============================ FASTAPI WEB PANEL ============================
+import asyncio
 
 WEB_PANEL_ENABLED = os.getenv("WEB_PANEL", "1").strip().lower() not in ("0", "false", "no", "off")
 WEB_PANEL_HOST = os.getenv("WEB_PANEL_HOST", "0.0.0.0").strip()
@@ -2662,6 +2714,11 @@ WEB_PANEL_TOKEN = os.getenv("WEB_PANEL_TOKEN", "").strip()
 if not WEB_PANEL_TOKEN:
     WEB_PANEL_TOKEN = secrets.token_urlsafe(12)
     print(f"   {c(213)}[webpanel]{R} Generated one-time access token: {BOLD}{WEB_PANEL_TOKEN}{R}  {DIM}(set WEB_PANEL_TOKEN env var for a fixed password){R}")
+
+PANEL_LOCK_TIMEOUT = 0.05
+PANEL_FAST_WAIT = 0.35
+
+_PANEL_ASYNC_LOCK = asyncio.Lock()
 
 WEB_CMD_QUEUE: deque = deque()
 WEB_CMD_RESULTS: dict = {}
@@ -2709,8 +2766,12 @@ class _PanelLogCapture:
             self.lines.append(f"[{stamp}] {clean}")
 
     def dump(self) -> list:
-        with self.lock:
+        if not self.lock.acquire(timeout=PANEL_LOCK_TIMEOUT):
+            return []
+        try:
             return list(self.lines)
+        finally:
+            self.lock.release()
 
 
 PANEL_LOGS = _PanelLogCapture()
@@ -2726,23 +2787,6 @@ def _panel_emit_hook(self, record):
 
 
 logging.StreamHandler.emit = _panel_emit_hook
-
-
-def execute_panel_command(tid: str, raw_cmd: str, is_owner: bool = True) -> dict:
-    raw = (raw_cmd or "").strip()
-    if not raw:
-        return {"ok": False, "output": "Command cannot be empty."}
-    cmd_text = raw if raw.startswith(PREFIX) else f"{PREFIX}{raw}"
-    req_id = secrets.token_hex(6)
-    done_ev = threading.Event()
-    with _WEB_CMD_LOCK:
-        WEB_CMD_QUEUE.append((req_id, tid, cmd_text, is_owner, done_ev))
-    done_ev.wait(timeout=12.0)
-    with _WEB_CMD_LOCK:
-        res = WEB_CMD_RESULTS.pop(req_id, None)
-    if res is not None:
-        return res
-    return {"ok": True, "output": f"Queued '{mask_secret(cmd_text)}' (bot loop busy or starting; check logs)."}
 
 
 def flush_web_commands() -> None:
@@ -2777,19 +2821,6 @@ def flush_web_commands() -> None:
             with _WEB_CMD_LOCK:
                 WEB_CMD_RESULTS[req_id] = result
             done_ev.set()
-
-
-def execute_panel_login(payload: dict) -> dict:
-    req_id = secrets.token_hex(6)
-    done_ev = threading.Event()
-    with _WEB_LOGIN_LOCK:
-        WEB_LOGIN_QUEUE.append((req_id, payload, done_ev))
-    done_ev.wait(timeout=45.0)
-    with _WEB_LOGIN_LOCK:
-        res = WEB_LOGIN_RESULTS.pop(req_id, None)
-    if res is not None:
-        return res
-    return {"ok": False, "message": "Login timed out or bot loop is still starting; check live logs."}
 
 
 def _perform_panel_login(payload: dict) -> dict:
@@ -2830,7 +2861,8 @@ def _perform_panel_login(payload: dict) -> dict:
                 except OSError:
                     pass
                 cl.set_settings({})
-                state["session_user"] = ""
+                with _STATE_LOCK:
+                    state["session_user"] = ""
 
             CREDS.update(username=username, password=password, totp=totp_seed, code=twofa_code)
             _login_password(username, password)
@@ -2847,10 +2879,12 @@ def _perform_panel_login(payload: dict) -> dict:
 
         if owner_in:
             OWNER_USERNAME = owner_in
-            state["owner_username"] = owner_in
+            with _STATE_LOCK:
+                state["owner_username"] = owner_in
             try:
                 owner_pk = str(paced(cl.user_id_from_username, owner_in))
-                state["owner_pk"], state["owner_pk_for"] = owner_pk, owner_in
+                with _STATE_LOCK:
+                    state["owner_pk"], state["owner_pk_for"] = owner_pk, owner_in
                 OWNER_PK = owner_pk
             except Exception as e:
                 log.warning("Could not resolve owner @%s right away: %s", owner_in, e)
@@ -2901,15 +2935,59 @@ def flush_panel_login() -> None:
         done_ev.set()
 
 
+def _safe_panel_path(rel_path: str):
+    cleaned = (rel_path or "").strip().replace("\\", "/").lstrip("/")
+    if not cleaned or ".." in Path(cleaned).parts:
+        return None
+    base = Path.cwd().resolve()
+    target = (base / cleaned).resolve()
+    if target == base or base not in target.parents:
+        return None
+    return target
+
+
+def _snapshot_state_sync(include_logs: bool = False) -> dict:
+    if not _STATE_LOCK.acquire(timeout=PANEL_LOCK_TIMEOUT):
+        return {}
+    try:
+        groups_list = [
+            {"id": gid, "name": gname, "ignored": gid in state.get("ignored", {})}
+            for gid, gname in list(group_names.items())
+        ]
+        payload = {
+            "bot_user": RUNTIME.get("me", ""),
+            "owner": OWNER_USERNAME or state.get("owner_username", ""),
+            "prefix": PREFIX,
+            "uptime": human_time(time.time() - START_TIME),
+            "follow_back_enabled": FOLLOW_BACK_ENABLED,
+            "follow_back_interval": FOLLOW_BACK_INTERVAL,
+            "followers_tracked": len(seen_followers),
+            "groups_count": len(groups_list),
+            "groups": groups_list,
+            "throttle": {
+                "strikes": throttle.strikes,
+                "total_hits": throttle.total_hits,
+                "cooldown_remaining": round(throttle.remaining(), 1),
+                "poll_multiplier": throttle.mult,
+            },
+            "state": copy.deepcopy(state),
+        }
+        if include_logs:
+            payload["logs"] = PANEL_LOGS.dump()
+        return payload
+    finally:
+        _STATE_LOCK.release()
+
+
 def _panel_html() -> str:
     return """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>IG GC Bot — Web Panel</title>
+<title>IG GC Bot — FastAPI Panel</title>
 <style>
-  :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--err:#f85149}
+  :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e}
   *{box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
   body{margin:0;background:var(--bg);color:var(--text)}
   header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;padding:14px 20px;background:var(--card);border-bottom:1px solid var(--border)}
@@ -2939,7 +3017,7 @@ def _panel_html() -> str:
 <header>
   <div>
     <h1>IG GC Bot Control Panel</h1>
-    <div class="sub" id="meta">Loading status...</div>
+    <div class="sub" id="meta">Loading state...</div>
   </div>
   <div class="row" style="max-width:340px">
     <input id="tok" type="password" placeholder="Panel Token / Password"/>
@@ -2966,9 +3044,9 @@ def _panel_html() -> str:
       <input id="loginUser" type="text" placeholder="bot_username"/>
       <label>Password</label>
       <input id="loginPass" type="password" placeholder="Password"/>
-      <label>2FA TOTP Secret Key (optional — for automatic 6-digit codes)</label>
+      <label>2FA TOTP Secret Key (optional)</label>
       <input id="loginTotp" type="text" placeholder="Base32 authenticator secret (optional)"/>
-      <label>Or One-Time 2FA Code (optional — 6 digits from SMS/authenticator)</label>
+      <label>Or One-Time 2FA Code (optional)</label>
       <input id="loginCode" type="text" maxlength="10" placeholder="123456"/>
       <label class="chk">
         <input id="loginFresh" type="checkbox"/>
@@ -2976,9 +3054,9 @@ def _panel_html() -> str:
       </label>
     </div>
 
-    <label>Owner Username (optional — updates owner if provided)</label>
+    <label>Owner Username (optional)</label>
     <input id="loginOwner" type="text" placeholder="your_instagram_username"/>
-    <label>Proxy URL (optional — e.g. http://user:pass@host:port)</label>
+    <label>Proxy URL (optional)</label>
     <input id="loginProxy" type="text" placeholder="Leave blank to keep current"/>
 
     <div class="row" style="margin-top:10px">
@@ -2989,9 +3067,9 @@ def _panel_html() -> str:
 
   <div class="card">
     <h2>Command Runner</h2>
-    <label>Target Group Chat (for GC-scoped commands)</label>
+    <label>Target Group Chat</label>
     <select id="gcSelect"><option value="">-- Select a GC or use default --</option></select>
-    <label>Command (with or without prefix, e.g. <code>ping</code>, <code>status</code>, <code>setname New Name</code>, <code>warn @user reason</code>)</label>
+    <label>Command</label>
     <div class="row">
       <input id="cmdInput" type="text" placeholder="Enter command..." onkeydown="if(event.key==='Enter')runCmd()"/>
       <button class="primary" style="max-width:110px" onclick="runCmd()">Run</button>
@@ -3015,21 +3093,21 @@ def _panel_html() -> str:
 
   <div class="card">
     <h2>Session &amp; State Files Manager</h2>
-    <label>Target File to Upload / Download</label>
+    <label>Target File</label>
     <select id="fileTarget">
-      <option value="session.json">session.json (active Instagram session)</option>
-      <option value="bot_state.json">bot_state.json (warnings, bans, sudo, settings)</option>
-      <option value="bots/dynamic_bots.json">bots/dynamic_bots.json (chat-added bots)</option>
-      <option value="accounts.json">accounts.json (multi-bot config)</option>
-      <option value="custom_bot_session">bots/&lt;name&gt;/session.json (sub-bot session file)</option>
+      <option value="session.json">session.json</option>
+      <option value="bot_state.json">bot_state.json</option>
+      <option value="bots/dynamic_bots.json">bots/dynamic_bots.json</option>
+      <option value="accounts.json">accounts.json</option>
+      <option value="custom_bot_session">bots/&lt;name&gt;/session.json</option>
     </select>
     <div id="subBotNameWrap" style="display:none">
-      <label>Sub-Bot Name (e.g. bot2)</label>
+      <label>Sub-Bot Name</label>
       <input id="subBotName" type="text" placeholder="bot2"/>
     </div>
-    <label>Upload JSON Session / State File</label>
+    <label>Upload JSON File</label>
     <input id="filePicker" type="file" accept=".json,application/json"/>
-    <label>Or Paste / Edit JSON Content Directly</label>
+    <label>Or Paste / Edit JSON Content</label>
     <textarea id="jsonEditor" rows="7" placeholder='{"uuids": ...}'></textarea>
     <div class="row" style="margin-top:8px">
       <button class="primary" onclick="uploadJson()">Save File</button>
@@ -3061,6 +3139,13 @@ function toggleLoginMode(){
   document.getElementById('passwordLoginBox').style.display = m==='password'?'block':'none';
 }
 
+async function fetchWithTimeout(url, opts={}, ms=3000){
+  const ctrl = new AbortController();
+  const timer = setTimeout(()=>ctrl.abort(), ms);
+  try{return await fetch(url, {...opts, signal: ctrl.signal})}
+  finally{clearTimeout(timer)}
+}
+
 async function doBotLogin(){
   const mode = document.getElementById('loginMode').value;
   const payload = {
@@ -3074,11 +3159,15 @@ async function doBotLogin(){
     owner_username: document.getElementById('loginOwner').value,
     proxy: document.getElementById('loginProxy').value,
   };
-  document.getElementById('loginOut').textContent = 'Logging in...';
-  const res = await fetch('/api/login',{method:'POST',headers:hdrs(),body:JSON.stringify(payload)});
-  const data = await res.json();
-  document.getElementById('loginOut').textContent = (data.message||'') + (data.hint ? '\\nHint: '+data.hint : '');
-  toast(data.ok ? 'Login succeeded' : 'Login failed');
+  document.getElementById('loginOut').textContent = 'Submitting login...';
+  try{
+    const res = await fetchWithTimeout('/api/login',{method:'POST',headers:hdrs(),body:JSON.stringify(payload)}, 4000);
+    const data = await res.json();
+    document.getElementById('loginOut').textContent = (data.message||'') + (data.hint ? '\\nHint: '+data.hint : '');
+    toast(data.ok ? (data.queued ? 'Login queued' : 'Login succeeded') : 'Login failed');
+  }catch(e){
+    document.getElementById('loginOut').textContent = 'Request timed out; check Live Bot Logs.';
+  }
   refreshAll();
 }
 
@@ -3102,9 +3191,13 @@ function resolvedTargetFile(){
 async function runCmd(custom){
   const cmd = custom || document.getElementById('cmdInput').value.trim();
   const tid = document.getElementById('gcSelect').value;
-  const res = await fetch('/api/command',{method:'POST',headers:hdrs(),body:JSON.stringify({command:cmd,thread_id:tid})});
-  const data = await res.json();
-  document.getElementById('cmdOut').textContent = data.output || JSON.stringify(data,null,2);
+  try{
+    const res = await fetchWithTimeout('/api/command',{method:'POST',headers:hdrs(),body:JSON.stringify({command:cmd,thread_id:tid})}, 4000);
+    const data = await res.json();
+    document.getElementById('cmdOut').textContent = data.output || JSON.stringify(data,null,2);
+  }catch(e){
+    document.getElementById('cmdOut').textContent = 'Command queued / timed out; check Live Bot Logs.';
+  }
   refreshAll();
 }
 function quickCmd(c){document.getElementById('cmdInput').value=c;runCmd(c)}
@@ -3114,14 +3207,14 @@ async function uploadJson(){
   let content = document.getElementById('jsonEditor').value;
   if(!content.trim()){toast('JSON content is empty');return}
   try{JSON.parse(content)}catch(err){toast('Invalid JSON: '+err.message);return}
-  const res = await fetch('/api/file',{method:'POST',headers:hdrs(),body:JSON.stringify({path,content})});
+  const res = await fetchWithTimeout('/api/file',{method:'POST',headers:hdrs(),body:JSON.stringify({path,content})}, 4000);
   const data = await res.json();
   toast(data.message || (data.ok?'Saved':'Failed'));
 }
 
 async function loadJsonFile(){
   const path = resolvedTargetFile();
-  const res = await fetch('/api/file?path='+encodeURIComponent(path),{headers:hdrs(false)});
+  const res = await fetchWithTimeout('/api/file?path='+encodeURIComponent(path),{headers:hdrs(false)}, 4000);
   const data = await res.json();
   if(data.ok){document.getElementById('jsonEditor').value=data.content;toast('Loaded '+path)}
   else toast(data.message||'Not found');
@@ -3132,19 +3225,28 @@ function downloadJsonFile(){
   window.open('/api/file?path='+encodeURIComponent(path)+'&download=1&token='+encodeURIComponent(getTok()),'_blank');
 }
 
+let inFlight = false;
 async function refreshAll(){
-  const res = await fetch('/api/status',{headers:hdrs(false)});
-  if(res.status===401){document.getElementById('meta').textContent='Unauthorized — enter panel token at top right';return}
-  const d = await res.json();
-  document.getElementById('meta').textContent = `Bot: @${d.bot_user||'starting'} | Owner: @${d.owner||'-'} | Prefix: "${d.prefix}" | Uptime: ${d.uptime} | Groups: ${d.groups_count}`;
-  const sel = document.getElementById('gcSelect');
-  const prev = sel.value;
-  sel.innerHTML = '<option value="">-- Default / Global --</option>';
-  for(const g of (d.groups||[])){
-    const o=document.createElement('option');o.value=g.id;o.textContent=`${g.name} (${g.id.slice(-6)})${g.ignored?' [IGNORED]':''}`;
-    if(g.id===prev)o.selected=true;sel.appendChild(o);
+  if(inFlight) return;
+  inFlight = true;
+  try{
+    const res = await fetchWithTimeout('/api/state?include_logs=1',{headers:hdrs(false)}, 2500);
+    if(res.status===401){document.getElementById('meta').textContent='Unauthorized — enter panel token at top right';return}
+    const d = await res.json();
+    if(!d.ok){document.getElementById('meta').textContent=d.message||'State busy';return}
+    document.getElementById('meta').textContent = `Bot: @${d.bot_user||'starting'} | Owner: @${d.owner||'-'} | Prefix: "${d.prefix}" | Uptime: ${d.uptime} | Groups: ${d.groups_count} | FollowBack: ${d.follow_back_enabled?'ON':'OFF'}`;
+    const sel = document.getElementById('gcSelect');
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">-- Default / Global --</option>';
+    for(const g of (d.groups||[])){
+      const o=document.createElement('option');o.value=g.id;o.textContent=`${g.name} (${g.id.slice(-6)})${g.ignored?' [IGNORED]':''}`;
+      if(g.id===prev)o.selected=true;sel.appendChild(o);
+    }
+    if(Array.isArray(d.logs)) document.getElementById('logsBox').textContent = d.logs.join('\n');
+  }catch(_e){
+  }finally{
+    inFlight = false;
   }
-  document.getElementById('logsBox').textContent = (d.logs||[]).join('\n');
 }
 
 document.getElementById('tok').value = getTok();
@@ -3155,143 +3257,196 @@ setInterval(refreshAll, 4000);
 </html>"""
 
 
-def _safe_panel_path(rel_path: str):
-    cleaned = (rel_path or "").strip().replace("\\", "/").lstrip("/")
-    if not cleaned or ".." in Path(cleaned).parts:
-        return None
-    base = Path.cwd().resolve()
-    target = (base / cleaned).resolve()
-    if target == base or base not in target.parents:
-        return None
-    return target
+class CommandPayload(BaseModel):
+    command: str
+    thread_id: str = "__panel__"
 
 
-class _BotWebPanelHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        return
+class LoginPayload(BaseModel):
+    mode: str = "session"
+    sessionid: str = ""
+    username: str = ""
+    password: str = ""
+    totp_seed: str = ""
+    twofa_code: str = ""
+    fresh_session: bool = False
+    owner_username: str = ""
+    proxy: str = ""
 
-    def _authorized(self, query_token: str = "") -> bool:
-        hdr = self.headers.get("X-Panel-Token", "").strip()
-        tok = hdr or query_token.strip()
-        return bool(tok) and _hmac.compare_digest(tok, WEB_PANEL_TOKEN)
 
-    def _send_json(self, code: int, payload: dict) -> None:
-        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+class FilePayload(BaseModel):
+    path: str
+    content: str
 
-    def _send_html(self, html_str: str) -> None:
-        raw = html_str.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
 
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        qs = urllib.parse.parse_qs(parsed.query)
-        q_tok = (qs.get("token") or [""])[0]
-        if parsed.path == "/":
-            return self._send_html(_panel_html())
-        if not self._authorized(q_tok):
-            return self._send_json(401, {"ok": False, "message": "Unauthorized. Provide X-Panel-Token."})
-        if parsed.path == "/api/status":
-            groups_list = [
-                {"id": gid, "name": gname, "ignored": is_ignored(gid)}
-                for gid, gname in group_names.items()
-            ]
-            return self._send_json(200, {
-                "ok": True,
-                "bot_user": RUNTIME.get("me", ""),
-                "owner": OWNER_USERNAME or state.get("owner_username", ""),
-                "prefix": PREFIX,
-                "uptime": human_time(time.time() - START_TIME),
-                "groups_count": len(groups_list),
-                "groups": groups_list,
-                "logs": PANEL_LOGS.dump(),
-            })
-        if parsed.path == "/api/file":
-            rel = (qs.get("path") or [""])[0]
-            target = _safe_panel_path(rel)
-            if not target or not target.exists():
-                return self._send_json(404, {"ok": False, "message": "File not found or invalid path."})
-            data_bytes = target.read_bytes()
-            if (qs.get("download") or ["0"])[0] == "1":
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
-                self.send_header("Content-Length", str(len(data_bytes)))
-                self.end_headers()
-                self.wfile.write(data_bytes)
-                return
-            return self._send_json(200, {"ok": True, "path": rel, "content": data_bytes.decode("utf-8", errors="replace")})
-        self._send_json(404, {"ok": False, "message": "Not found"})
+def require_panel_token(
+    x_panel_token: str = Header(default=""),
+    token: str = "",
+) -> None:
+    supplied = (x_panel_token or token or "").strip()
+    if not supplied or not hmac.compare_digest(supplied, WEB_PANEL_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized. Provide X-Panel-Token.")
 
-    def do_POST(self):
-        parsed = urllib.parse.urlparse(self.path)
-        if not self._authorized():
-            return self._send_json(401, {"ok": False, "message": "Unauthorized. Provide X-Panel-Token."})
+
+panel_router = APIRouter()
+
+
+@panel_router.get("/", response_class=HTMLResponse)
+async def panel_index():
+    return HTMLResponse(content=_panel_html())
+
+
+@panel_router.get("/api/state", dependencies=[Depends(require_panel_token)])
+async def api_state(include_logs: bool = False):
+    try:
+        await asyncio.wait_for(_PANEL_ASYNC_LOCK.acquire(), timeout=PANEL_LOCK_TIMEOUT)
+    except asyncio.TimeoutError:
+        return JSONResponse({"ok": False, "busy": True, "message": "Panel lock busy; retry shortly."})
+
+    try:
+        loop = asyncio.get_running_loop()
+        snap = await loop.run_in_executor(None, _snapshot_state_sync, include_logs)
+        if not snap:
+            return JSONResponse({"ok": False, "busy": True, "message": "State lock contended; retry shortly."})
+        return JSONResponse({"ok": True, **snap})
+    finally:
+        _PANEL_ASYNC_LOCK.release()
+
+
+@panel_router.post("/api/command", dependencies=[Depends(require_panel_token)])
+async def api_command(payload: CommandPayload):
+    raw = payload.command.strip()
+    if not raw:
+        return {"ok": False, "output": "Command cannot be empty."}
+    cmd_text = raw if raw.startswith(PREFIX) else f"{PREFIX}{raw}"
+    tid = payload.thread_id.strip() or "__panel__"
+    req_id = secrets.token_hex(6)
+    done_ev = threading.Event()
+
+    if not _WEB_CMD_LOCK.acquire(timeout=PANEL_LOCK_TIMEOUT):
+        return {"ok": True, "queued": True, "output": "Command queue busy; try again."}
+    try:
+        WEB_CMD_QUEUE.append((req_id, tid, cmd_text, True, done_ev))
+    finally:
+        _WEB_CMD_LOCK.release()
+    wake_panel_loop()
+
+    loop = asyncio.get_running_loop()
+    finished = await loop.run_in_executor(None, done_ev.wait, PANEL_FAST_WAIT)
+    if finished and _WEB_CMD_LOCK.acquire(timeout=PANEL_LOCK_TIMEOUT):
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = 0
-        body = self.rfile.read(max(0, length)).decode("utf-8", errors="replace")
+            res = WEB_CMD_RESULTS.pop(req_id, None)
+            if res is not None:
+                return res
+        finally:
+            _WEB_CMD_LOCK.release()
+
+    return {
+        "ok": True,
+        "queued": True,
+        "output": f"Queued '{mask_secret(cmd_text)}' — bot is busy; check Live Bot Logs shortly.",
+    }
+
+
+@panel_router.post("/api/login", dependencies=[Depends(require_panel_token)])
+async def api_login(payload: LoginPayload):
+    req_id = secrets.token_hex(6)
+    done_ev = threading.Event()
+
+    if not _WEB_LOGIN_LOCK.acquire(timeout=PANEL_LOCK_TIMEOUT):
+        return {"ok": False, "busy": True, "message": "Login queue busy; retry shortly."}
+    try:
+        WEB_LOGIN_QUEUE.append((req_id, payload.model_dump(), done_ev))
+    finally:
+        _WEB_LOGIN_LOCK.release()
+    wake_panel_loop()
+
+    loop = asyncio.get_running_loop()
+    finished = await loop.run_in_executor(None, done_ev.wait, PANEL_FAST_WAIT)
+    if finished and _WEB_LOGIN_LOCK.acquire(timeout=PANEL_LOCK_TIMEOUT):
         try:
-            payload = json.loads(body) if body else {}
-        except Exception as e:
-            return self._send_json(400, {"ok": False, "message": f"Invalid JSON body: {e}"})
+            res = WEB_LOGIN_RESULTS.pop(req_id, None)
+            if res is not None:
+                return res
+        finally:
+            _WEB_LOGIN_LOCK.release()
 
-        if parsed.path == "/api/login":
-            res = execute_panel_login(payload if isinstance(payload, dict) else {})
-            return self._send_json(200, res)
+    return {
+        "ok": True,
+        "queued": True,
+        "message": "Login queued — processing in bot loop; check Live Bot Logs shortly.",
+    }
 
-        if parsed.path == "/api/command":
-            cmd = str(payload.get("command") or "")
-            tid = str(payload.get("thread_id") or "__panel__").strip() or "__panel__"
-            res = execute_panel_command(tid, cmd, is_owner=True)
-            return self._send_json(200, res)
 
-        if parsed.path == "/api/file":
-            rel = str(payload.get("path") or "")
-            content = str(payload.get("content") or "")
-            target = _safe_panel_path(rel)
-            if not target:
-                return self._send_json(400, {"ok": False, "message": "Invalid file path."})
-            try:
-                json.loads(content)
-            except Exception as e:
-                return self._send_json(400, {"ok": False, "message": f"Content is not valid JSON: {e}"})
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-            try:
-                os.chmod(target, 0o600)
-            except OSError:
-                pass
-            if target.name == "bot_state.json":
+@panel_router.get("/api/file", dependencies=[Depends(require_panel_token)])
+async def api_get_file(path: str = "", download: int = 0):
+    target = _safe_panel_path(path)
+    if not target or not target.exists():
+        raise HTTPException(status_code=404, detail="File not found or invalid path.")
+    loop = asyncio.get_running_loop()
+    data_bytes = await loop.run_in_executor(None, target.read_bytes)
+    if download == 1:
+        return Response(
+            content=data_bytes,
+            media_type="application/json; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{target.name}"'},
+        )
+    return {"ok": True, "path": path, "content": data_bytes.decode("utf-8", errors="replace")}
+
+
+@panel_router.post("/api/file", dependencies=[Depends(require_panel_token)])
+async def api_save_file(payload: FilePayload):
+    target = _safe_panel_path(payload.path)
+    if not target:
+        raise HTTPException(status_code=400, detail="Invalid file path.")
+    try:
+        json.loads(payload.content)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Content is not valid JSON: {e}")
+
+    def _write():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(payload.content, encoding="utf-8")
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+        if target.name == "bot_state.json":
+            with _STATE_LOCK:
                 state.clear()
                 state.update(load_state())
                 USER_CACHE.clear()
                 USER_CACHE.update(state.get("user_cache") or {})
-            log.info("🌐 Web Panel updated file: %s", rel)
-            return self._send_json(200, {"ok": True, "message": f"Saved {rel}"})
 
-        self._send_json(404, {"ok": False, "message": "Not found"})
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _write)
+    log.info("🌐 Web Panel updated file: %s", payload.path)
+    return {"ok": True, "message": f"Saved {payload.path}"}
+
+
+app = FastAPI(title="IG GC Bot Panel")
+app.include_router(panel_router)
 
 
 def start_web_panel() -> None:
     if not WEB_PANEL_ENABLED:
         return
+
+    def _serve():
+        config = uvicorn.Config(
+            app,
+            host=WEB_PANEL_HOST,
+            port=WEB_PANEL_PORT,
+            log_level="warning",
+        )
+        server = uvicorn.Server(config)
+        server.run()
+
     try:
-        server = ThreadingHTTPServer((WEB_PANEL_HOST, WEB_PANEL_PORT), _BotWebPanelHandler)
+        threading.Thread(target=_serve, name="webpanel", daemon=True).start()
+        log.info("🌐 FastAPI Web Panel listening on http://%s:%s", WEB_PANEL_HOST, WEB_PANEL_PORT)
     except Exception as e:
-        log.warning("Web Panel failed to bind %s:%s (%s)", WEB_PANEL_HOST, WEB_PANEL_PORT, e)
-        return
-    threading.Thread(target=server.serve_forever, name="webpanel", daemon=True).start()
-    log.info("🌐 Web Panel listening on http://%s:%s", WEB_PANEL_HOST, WEB_PANEL_PORT)
+        log.warning("Web Panel failed to start on %s:%s (%s)", WEB_PANEL_HOST, WEB_PANEL_PORT, e)
 
 
 def main() -> None:
@@ -3325,8 +3480,9 @@ def main() -> None:
             owner_pk = str(state["owner_pk"])
         else:
             owner_pk = str(paced(cl.user_id_from_username, OWNER_USERNAME))
-            state["owner_pk"], state["owner_pk_for"] = owner_pk, OWNER_USERNAME
-            save_state()
+            with _STATE_LOCK:
+                state["owner_pk"], state["owner_pk_for"] = owner_pk, OWNER_USERNAME
+                save_state()
         OWNER_PK = owner_pk
     except Exception as e:
         sys.exit(f"\n   {c(196)}✖ Owner username '{OWNER_USERNAME}' not found: {e}{R}")
@@ -3415,8 +3571,8 @@ def main() -> None:
                 errors += 1
                 wait = min(300, 15 * errors)
                 log.error("Loop error (%s). Backing off %ss", e, wait)
-                STOP.wait(wait)
-        STOP.wait(throttle.poll_delay())
+                sleep_interruptible(wait)
+        sleep_interruptible(throttle.poll_delay())
     goodbye()
 
 
